@@ -3,6 +3,26 @@
 All notable changes to `gh-reaper` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.0] - 2026-06-08
+
+### Added
+- **Native agent worktrees are first-class.** Gemini CLI (`gemini --worktree`)
+  and Qwen Code (`qwen --worktree`) now create their own git worktrees nested in
+  the repo — `<repo>/.gemini/worktrees/<slug>/` and `<repo>/.qwen/worktrees/<slug>/`,
+  alongside Claude Code's `<repo>/.claude/worktrees/`. Discovery already finds
+  these (they sit under scanned roots and aren't pruned); verified end-to-end by
+  driving both agents and reaping the result with `gh reaper --merged --reap`.
+
+### Fixed
+- **Agent session markers no longer mark a worktree `dirty`.** Qwen Code drops a
+  `.qwen-session` session-id pointer into every worktree it creates. That lone
+  untracked file made each finished Qwen worktree classify as `dirty`, so
+  `gh reaper --merged --reap` skipped it (it needs `--force`). Such markers are
+  now treated like `.gitignore`d files — unconditionally, with no
+  `--no-ignore-locks` opt-out, since a session pointer is never authored work —
+  so abandoned agent worktrees read as `merged`/`clean` and sweep cleanly. Added
+  a regression test.
+
 ## [1.5.1] - 2026-06-05
 
 ### Fixed

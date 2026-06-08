@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # gh-reaper - GitHub CLI extension that harvests stale git worktrees
-# Version: 1.5.1
+# Version: 1.6.0
 # https://github.com/ai-ecoverse/gh-reaper
 #
 # Seasons don't fear the reaper. Nor do your forgotten worktrees -- until now.
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.1"
+VERSION="1.6.0"
 EXTENSION_NAME="gh-reaper"
 
 # Absolute path to this script, so we can re-invoke ourselves as parallel
@@ -218,23 +218,17 @@ file_mtime() {
 # reset a worktree's apparent age. Prints 0 when there are no such files.
 newest_unignored_mtime() {
     local wt="$1" newest
-    # Regenerable lock files are excluded too (unless --no-ignore-locks), so a
-    # lone `npm install` doesn't make a stale worktree look freshly touched.
-    if [ "${REAPER_IGNORE_LOCKS:-1}" = 1 ]; then
-        newest="$( { git -C "$wt" ls-files -z -- . "${LOCK_EXCLUDE[@]}" 2>/dev/null
-                     git -C "$wt" ls-files -z --others --exclude-standard -- . "${LOCK_EXCLUDE[@]}" 2>/dev/null; } \
-            | ( cd "$wt" 2>/dev/null || exit 0
-                if [ "$STAT_GNU" = 1 ]; then xargs -0 stat -c %Y 2>/dev/null
-                else                          xargs -0 stat -f %m 2>/dev/null; fi ) \
-            | sort -rn | head -1 )"
-    else
-        newest="$( { git -C "$wt" ls-files -z 2>/dev/null
-                     git -C "$wt" ls-files -z --others --exclude-standard 2>/dev/null; } \
-            | ( cd "$wt" 2>/dev/null || exit 0
-                if [ "$STAT_GNU" = 1 ]; then xargs -0 stat -c %Y 2>/dev/null
-                else                          xargs -0 stat -f %m 2>/dev/null; fi ) \
-            | sort -rn | head -1 )"
-    fi
+    # Agent session markers are always excluded; regenerable lock files too,
+    # unless --no-ignore-locks -- so a lone `npm install` or an agent's session
+    # pointer doesn't make a stale worktree look freshly touched.
+    local excl=( "${ARTIFACT_EXCLUDE[@]}" )
+    [ "${REAPER_IGNORE_LOCKS:-1}" = 1 ] && excl+=( "${LOCK_EXCLUDE[@]}" )
+    newest="$( { git -C "$wt" ls-files -z -- . "${excl[@]}" 2>/dev/null
+                 git -C "$wt" ls-files -z --others --exclude-standard -- . "${excl[@]}" 2>/dev/null; } \
+        | ( cd "$wt" 2>/dev/null || exit 0
+            if [ "$STAT_GNU" = 1 ]; then xargs -0 stat -c %Y 2>/dev/null
+            else                          xargs -0 stat -f %m 2>/dev/null; fi ) \
+        | sort -rn | head -1 )"
     case "$newest" in ''|*[!0-9]*) echo 0 ;; *) echo "$newest" ;; esac
 }
 
@@ -298,6 +292,26 @@ for __lock in "${REGENERABLE_LOCKS[@]}"; do
     LOCK_EXCLUDE+=( ":(exclude)$__lock" ":(exclude)*/$__lock" )
 done
 unset __lock
+
+# Agent session markers: ephemeral bookkeeping a coding agent drops into the
+# worktree it just created (e.g. a session-id pointer), never authored work.
+# Such a file lands in *every* worktree the agent makes, so left uncounted it
+# brands each finished agent worktree `dirty` and keeps `gh reaper --merged
+# --reap` from ever sweeping it. Excluded unconditionally (no --no-ignore-locks
+# escape hatch): there is no reading under which a session pointer is worth
+# preserving. Agents that nest a native worktree under the repo and drop a
+# marker:
+#   qwen        <repo>/.qwen/worktrees/<slug>/.qwen-session
+# (gemini and Claude Code nest at <repo>/.gemini|.claude/worktrees/<slug>/ but
+#  leave the tree clean, so they need no marker entry here.)
+AGENT_ARTIFACTS=(
+    .qwen-session
+)
+ARTIFACT_EXCLUDE=()
+for __art in "${AGENT_ARTIFACTS[@]}"; do
+    ARTIFACT_EXCLUDE+=( ":(exclude)$__art" ":(exclude)*/$__art" )
+done
+unset __art
 
 resolve_roots() {
     local candidates=()
@@ -396,13 +410,12 @@ inspect_marker() {
         branch="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
         [ -z "$branch" ] && branch="detached@$(git -C "$wt" rev-parse --short HEAD 2>/dev/null || echo '?')"
 
-        # Dirty = uncommitted/untracked changes. Regenerable lock-file churn is
-        # excluded by default (a lone package-lock.json edit doesn't count).
-        if [ "${REAPER_IGNORE_LOCKS:-1}" = 1 ]; then
-            [ -n "$(git -C "$wt" status --porcelain -- . "${LOCK_EXCLUDE[@]}" 2>/dev/null)" ] && dirty=1
-        else
-            [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] && dirty=1
-        fi
+        # Dirty = uncommitted/untracked changes. Agent session markers never
+        # count; regenerable lock-file churn doesn't either, unless
+        # --no-ignore-locks (a lone package-lock.json edit isn't authored work).
+        local dirty_excl=( "${ARTIFACT_EXCLUDE[@]}" )
+        [ "${REAPER_IGNORE_LOCKS:-1}" = 1 ] && dirty_excl+=( "${LOCK_EXCLUDE[@]}" )
+        [ -n "$(git -C "$wt" status --porcelain -- . "${dirty_excl[@]}" 2>/dev/null)" ] && dirty=1
 
         # Unpushed = commits that live nowhere on a remote.
         if up="$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"; then
@@ -488,9 +501,9 @@ reap_one() {
     fi
     local args=(worktree remove)
     # Risky statuses force by classification. A worktree we already judged
-    # reapable (clean/merged) can still carry ignored lock-file churn that plain
-    # `git worktree remove` refuses ("contains modified or untracked files") --
-    # force past that too, since the decision to reap is already made.
+    # reapable (clean/merged) can still carry ignored lock-file churn or an agent
+    # session file that plain `git worktree remove` refuses ("contains modified
+    # or untracked files") -- force past that too, the decision to reap is made.
     if is_risky "$status" || [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
         args+=(--force)
     fi

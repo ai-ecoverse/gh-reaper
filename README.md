@@ -24,10 +24,10 @@ Worktrees are wonderful — until you have forty of them. Tools like [Conductor]
 
 ## Features
 
-- **Machine-wide discovery** — sweeps your usual code roots (`~/Developer`, `~/conductor`, `~/intent/workspaces`, `~/.codex/worktrees`, `~/Projects`, `~/go/src`, …) for linked worktrees, not just the repo you're standing in. Knows where agent tools (Conductor, yolo, intent, Codex) stash their checkouts — and finds Claude Code's `<repo>/.claude/worktrees/` automatically since they nest inside scanned repos.
+- **Machine-wide discovery** — sweeps your usual code roots (`~/Developer`, `~/conductor`, `~/intent/workspaces`, `~/.codex/worktrees`, `~/Projects`, `~/go/src`, …) for linked worktrees, not just the repo you're standing in. Knows where agent tools (Conductor, yolo, intent, Codex) stash their checkouts — and the worktrees agents nest *inside* a repo are found automatically, since those repos already sit under scanned roots: Claude Code's `<repo>/.claude/worktrees/`, Gemini CLI's `<repo>/.gemini/worktrees/`, and Qwen Code's `<repo>/.qwen/worktrees/`.
 - **Age & size at a glance** — every worktree shows when it was last touched and how much disk it occupies, sorted oldest-first. "Touched" means the newest **non-gitignored** change, so a routine `npm install` or build doesn't make a months-old worktree look brand new.
 - **Knows what's already done** — flags worktrees whose `HEAD` is already merged into the default branch (`merged`), and optionally asks `gh` whether a branch's PR was squash-merged (`pr-merged`, via `--check-prs`). Sweep just the finished ones with `gh reaper --merged --reap`.
-- **Safety classification** — each worktree is tagged `merged`, `clean`, `dirty`, `unpushed`, or `orphan`. Risky ones are never reaped without `--force`. Regenerable dependency lock files (`package-lock.json`, `yarn.lock`, `Cargo.lock`, …) are treated like `.gitignore`d files, so a stray `npm install` doesn't flag a finished worktree as `dirty` (opt out with `--no-ignore-locks`).
+- **Safety classification** — each worktree is tagged `merged`, `clean`, `dirty`, `unpushed`, or `orphan`. Risky ones are never reaped without `--force`. Regenerable dependency lock files (`package-lock.json`, `yarn.lock`, `Cargo.lock`, …) are treated like `.gitignore`d files, so a stray `npm install` doesn't flag a finished worktree as `dirty` (opt out with `--no-ignore-locks`). An agent's own session marker (like Qwen Code's `.qwen-session`) is ignored the same way — and always — so a worktree an agent created and abandoned still reads as `merged`/`clean` and sweeps with `gh reaper --merged --reap`.
 - **macOS-friendly** — scans a curated set of dev directories by default, so it's fast and **never trips macOS privacy (TCC) permission prompts** for Desktop, Documents, Downloads, Photos, and friends.
 - **Reaps the right way** — uses `git worktree remove` (run from the main worktree) so git's bookkeeping stays consistent; `--prune` tidies the admin entries afterward.
 - **Read-only by default** — bare `gh reaper` only lists; nothing is deleted until you pass `--reap`. Then confirm each one, `[a]ll` at once, or add `--yes` to sweep unattended. `--json` for the scripty.
@@ -123,6 +123,16 @@ supersede the `unpushed` warning, since those commits are accounted for upstream
 its age — so a `npm install` that rewrites `package-lock.json` can't keep a
 finished worktree out of the harvest. A lock change next to any real edit still
 counts as dirty. Pass `--no-ignore-locks` to disable this.
+
+**Agent session markers don't count as dirty either.** Coding agents that spin up
+their own git worktree drop a little bookkeeping file into it — Qwen Code, for
+instance, writes a session-id pointer to `<repo>/.qwen/worktrees/<slug>/.qwen-session`.
+Left uncounted, that marker would brand *every* worktree the agent ever made as
+`dirty` and keep `gh reaper --merged --reap` from sweeping it. So these markers are
+treated like `.gitignore`d files — unconditionally (there's no `--no-ignore-locks`
+escape hatch; a session pointer is never authored work). Gemini CLI and Claude
+Code nest their worktrees the same way but leave the tree clean, so they need no
+special handling.
 
 ## How it works
 
