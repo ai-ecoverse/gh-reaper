@@ -267,6 +267,70 @@ if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
+# Agent session markers: a coding agent (e.g. Qwen Code) drops a .qwen-session
+# pointer into the worktree it creates. A merged worktree whose only change is
+# that marker must NOT be dirty -- even with --no-ignore-locks, since a session
+# pointer is never authored work -- and must still reap under --merged --reap.
+# The marker beside a real edit stays dirty.
+# ---------------------------------------------------------------------------
+if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    QSBX="$(mktemp -d)/qsess"; mkdir -p "$QSBX"
+    (
+        cd "$QSBX" || exit 1
+        g init --bare remote.git >/dev/null
+        g init repo >/dev/null
+        cd repo || exit 1
+        g remote add origin "$QSBX/remote.git"
+        echo hi > a.txt; g add a.txt; g commit -qm init
+        g push -q -u origin main
+        g remote set-head origin main
+
+        # merged branch, then a lone .qwen-session marker in the worktree
+        g worktree add -q ../wt-sess -b feat-sess
+        ( cd ../wt-sess && echo s > s.txt && g add s.txt && g commit -qm "feature" )
+        g merge -q --no-ff feat-sess -m "merge feat-sess"; g push -q origin main
+        printf '11111111-2222-3333-4444-555555555555' > ../wt-sess/.qwen-session
+
+        # merged branch, .qwen-session marker + a real untracked edit
+        g worktree add -q ../wt-sess-real -b feat-sess-real
+        ( cd ../wt-sess-real && echo t > t.txt && g add t.txt && g commit -qm "feature2" )
+        g merge -q --no-ff feat-sess-real -m "merge feat-sess-real"; g push -q origin main
+        printf '99999999-8888-7777-6666-555555555555' > ../wt-sess-real/.qwen-session
+        echo real > ../wt-sess-real/real.txt
+    ) >/dev/null 2>&1
+
+    sstatusof() { "$REAPER" --json ${2:-} --path "$QSBX" 2>/dev/null \
+        | jq -r --arg b "$1" '.[]|select(.branch==$b)|.status' 2>/dev/null; }
+
+    check  # session-only marker -> merged (not dirty) by default
+    s="$(sstatusof feat-sess)"
+    [ "$s" = "merged" ] && ok "session marker alone is not dirty (default)" \
+        || no "session marker alone is not dirty (default)" "got: $s"
+
+    check  # always ignored: --no-ignore-locks must NOT make it dirty
+    s="$(sstatusof feat-sess --no-ignore-locks)"
+    [ "$s" = "merged" ] && ok "session marker stays clean under --no-ignore-locks" \
+        || no "session marker stays clean under --no-ignore-locks" "got: $s"
+
+    check  # session marker + a real edit stays dirty
+    s="$(sstatusof feat-sess-real)"
+    [ "$s" = "dirty merged" ] && ok "session marker + real edit stays dirty" \
+        || no "session marker + real edit stays dirty" "got: $s"
+
+    check  # a session-only merged worktree actually reaps (git would otherwise
+           # refuse the untracked .qwen-session); the marker+real one is skipped
+    "$REAPER" --reap --yes --merged --no-color --path "$QSBX" >/dev/null 2>&1
+    if [ ! -d "$QSBX/wt-sess" ] && [ -d "$QSBX/wt-sess-real" ]; then
+        ok "session-only merged worktree reaps; marker+real skipped"
+    else
+        no "session-only merged worktree reaps; marker+real skipped" \
+           "wt-sess=$([ -d "$QSBX/wt-sess" ]&&echo y||echo n) wt-sess-real=$([ -d "$QSBX/wt-sess-real" ]&&echo y||echo n)"
+    fi
+
+    rm -rf "$(dirname "$QSBX")"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 printf "Tests run: %d   ${GREEN}passed: %d${NC}   ${RED}failed: %d${NC}\n" "$RUN" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
