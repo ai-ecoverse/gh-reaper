@@ -27,7 +27,8 @@ Worktrees are wonderful — until you have forty of them. Tools like [Conductor]
 - **Machine-wide discovery** — sweeps your usual code roots (`~/Developer`, `~/conductor`, `~/intent/workspaces`, `~/.codex/worktrees`, `~/Projects`, `~/go/src`, …) for linked worktrees, not just the repo you're standing in. Knows where agent tools (Conductor, yolo, intent, Codex) stash their checkouts — and the worktrees agents nest *inside* a repo are found automatically, since those repos already sit under scanned roots: Claude Code's `<repo>/.claude/worktrees/`, Gemini CLI's `<repo>/.gemini/worktrees/`, and Qwen Code's `<repo>/.qwen/worktrees/`.
 - **Age & size at a glance** — every worktree shows when it was last touched and how much disk it occupies, sorted oldest-first. "Touched" means the newest **non-gitignored** change, so a routine `npm install` or build doesn't make a months-old worktree look brand new.
 - **Knows what's already done** — flags worktrees whose `HEAD` is already merged into the default branch (`merged`), and optionally asks `gh` whether a branch's PR was squash-merged (`pr-merged`, via `--check-prs`). Sweep just the finished ones with `gh reaper --merged --reap`.
-- **Safety classification** — each worktree is tagged `merged`, `clean`, `dirty`, `unpushed`, or `orphan`. Risky ones are never reaped without `--force`. Regenerable dependency lock files (`package-lock.json`, `yarn.lock`, `Cargo.lock`, …) are treated like `.gitignore`d files, so a stray `npm install` doesn't flag a finished worktree as `dirty` (opt out with `--no-ignore-locks`). An agent's own session marker (like Qwen Code's `.qwen-session`) is ignored the same way — and always — so a worktree an agent created and abandoned still reads as `merged`/`clean` and sweeps with `gh reaper --merged --reap`.
+- **Won't sweep active work** — a worktree with a live process inside it (an agent mid-run, a dev server, a test watcher) is flagged `busy` and skipped, however merged its branch looks. Idle terminal tabs don't count, so a shell you left parked in a finished worktree won't pin it forever.
+- **Safety classification** — each worktree is tagged `merged`, `clean`, `dirty`, `unpushed`, `busy`, `locked`, or `orphan`. Risky ones are never reaped without `--force`. Regenerable dependency lock files (`package-lock.json`, `yarn.lock`, `Cargo.lock`, …) are treated like `.gitignore`d files, so a stray `npm install` doesn't flag a finished worktree as `dirty` (opt out with `--no-ignore-locks`). An agent's own session marker (like Qwen Code's `.qwen-session`) is ignored the same way — and always — so a worktree an agent created and abandoned still reads as `merged`/`clean` and sweeps with `gh reaper --merged --reap`.
 - **macOS-friendly** — scans a curated set of dev directories by default, so it's fast and **never trips macOS privacy (TCC) permission prompts** for Desktop, Documents, Downloads, Photos, and friends.
 - **Reaps the right way** — uses `git worktree remove` (run from the main worktree) so git's bookkeeping stays consistent; `--prune` tidies the admin entries afterward.
 - **Read-only by default** — bare `gh reaper` only lists; nothing is deleted until you pass `--reap`. Then confirm each one, `[a]ll` at once, or add `--yes` to sweep unattended. `--json` for the scripty.
@@ -90,7 +91,8 @@ gh reaper [OPTIONS] [PATH...]
   -j, --jobs N         Parallel inspection workers (default: CPU count; 1 = serial)
   -a, --all            Scan all of $HOME (still skips TCC-protected dirs)
   -y, --yes            With --reap, delete without prompting for each worktree
-  -f, --force          With --reap, also remove dirty, unpushed, or orphaned worktrees
+  -f, --force          With --reap, also remove dirty, unpushed, busy, or
+                       orphaned worktrees
       --prune          With --reap, run 'git worktree prune' on touched repos afterward
       --json           Emit results as JSON (always read-only)
       --dry-run        List only, change nothing (this is the default; kept for habit)
@@ -108,11 +110,30 @@ gh reaper [OPTIONS] [PATH...]
 | `clean`     | No local changes; HEAD exists on a remote — safe to delete     | ✅ yes               |
 | `dirty`     | Uncommitted or untracked changes present                       | 🔒 needs `--force`  |
 | `unpushed`  | Commits that exist nowhere on a remote (would be lost)         | 🔒 needs `--force`  |
+| `busy`      | A live process is working in this tree right now               | 🔒 needs `--force`  |
+| `locked`    | `git worktree lock` is set; a stale lock is lifted on reap     | ✅ yes (if stale)    |
 | `orphan`    | The main repository is gone; only the lonely checkout remains  | 🔒 needs `--force`  |
 
 A worktree can combine flags — e.g. `dirty merged` means the commits are merged but
 there are still uncommitted edits, so it needs `--force`. `merged`/`pr-merged`
 supersede the `unpushed` warning, since those commits are accounted for upstream.
+
+**`busy` beats `merged`.** A finished branch is not a finished *session*. If a
+process has its current directory inside the worktree, it reads `busy merged`
+and `--merged --reap --yes` will skip it — deleting a tree an agent is working in
+loses whatever it hadn't committed yet. Detection is one process-table scan per
+run (`/proc` on Linux, `lsof` elsewhere); if neither is available the flag simply
+never fires, and the git-based classification carries on as before. Interactive
+shells (`bash`, `zsh`, `fish`, …) are excluded, as is `gh reaper`'s own process
+chain — otherwise running it from inside a worktree would pin that worktree.
+
+**Stale locks are lifted, held locks are not.** `git worktree lock` blocks
+removal outright, and `--force` doesn't override it (git wants `remove -f -f`).
+Agent harnesses lock a tree for the session and stamp the reason with their pid,
+so a crashed session leaves a lock that pins the worktree forever. Reaping reads
+that reason: if the owning process is gone the lock is lifted with
+`git worktree unlock` and the reap proceeds; if it's still alive the worktree
+reads `busy locked` and is spared.
 
 **Lock files don't count as dirty.** Regenerable dependency lock files
 (`package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`,
@@ -146,12 +167,13 @@ special handling.
 
 **Merged detection.** Beyond age, each worktree is checked for whether its work is already done. The offline check is `git merge-base --is-ancestor HEAD <default-branch>` — if true, every commit is already in the default branch, so the worktree is tagged `merged` regardless of how recently its files were touched. GitHub's "Squash & merge" rewrites history, so a merged branch may not be an ancestor; `--check-prs` covers that by asking `gh pr list --state merged` per unconfirmed branch (networked, opt-in) and tagging matches `pr-merged`. Either way, merged work is safe to reap without `--force` (unless the working tree is also dirty).
 
-**Reaping** happens only under `--reap` — bare `gh reaper` is a read-only listing. Clean worktrees are removed with `git worktree remove` executed from the *main* worktree (so git won't refuse to remove "the current working tree"). Dirty/unpushed worktrees get `--force` only when you pass `--force`. True orphans — whose main repo is gone, so git can't help — are removed with `rm -rf`, and also only under `--force`.
+**Reaping** happens only under `--reap` — bare `gh reaper` is a read-only listing. Clean worktrees are removed with `git worktree remove` executed from the *main* worktree (so git won't refuse to remove "the current working tree"). Dirty/unpushed/busy worktrees get `--force` only when you pass `--force`. A worktree carrying a stale lock is unlocked first, since `git worktree remove --force` refuses locked trees regardless. True orphans — whose main repo is gone, so git can't help — are removed with `rm -rf`, and also only under `--force`.
 
 ## Safety
 
 - **Read-only by default.** Nothing is ever removed unless you pass `--reap`; `--dry-run` and `--json` are always read-only, and `--yes`/`--force` do nothing on their own.
-- `dirty`, `unpushed`, and `orphan` worktrees are **skipped unless `--force`** — your uncommitted edits and unpushed commits are safe by default.
+- `dirty`, `unpushed`, `busy`, and `orphan` worktrees are **skipped unless `--force`** — your uncommitted edits, unpushed commits, and in-flight sessions are safe by default.
+- **Work in progress outranks a merged branch.** A live process inside a worktree marks it `busy`, so even `--merged --reap --yes` leaves it alone.
 - With `--reap`, interactive mode asks per worktree (`[y]es / [n]o / [a]ll / [q]uit`); add `--yes` to skip the prompts.
 - It only ever targets linked worktrees — it will never offer to delete a main repository.
 

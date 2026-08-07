@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # gh-reaper - GitHub CLI extension that harvests stale git worktrees
-# Version: 1.6.0
+# Version: 1.7.0
 # https://github.com/ai-ecoverse/gh-reaper
 #
 # Seasons don't fear the reaper. Nor do your forgotten worktrees -- until now.
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 EXTENSION_NAME="gh-reaper"
 
 # Absolute path to this script, so we can re-invoke ourselves as parallel
@@ -89,6 +89,11 @@ DESCRIPTION:
   already MERGED into the repo's default branch -- a far stronger "done" signal
   than age alone.
 
+  A worktree someone is working in right now is BUSY -- a running process (an
+  agent, a dev server, a test watcher) has its current directory inside the
+  tree. Busy worktrees are never swept without --force, however merged they
+  look. Idle interactive shells don't count.
+
 OPTIONS:
   -r, --reap           Delete worktrees (interactive unless --yes). Without this,
                        gh reaper only lists -- it never removes anything.
@@ -105,7 +110,8 @@ OPTIONS:
   -j, --jobs N         Parallel inspection workers (default: CPU count; 1 = serial)
   -a, --all            Scan all of \$HOME (still skips TCC-protected dirs)
   -y, --yes            With --reap, delete without prompting for each worktree
-  -f, --force          With --reap, also remove dirty, unpushed, or orphaned worktrees
+  -f, --force          With --reap, also remove dirty, unpushed, busy, or
+                       orphaned worktrees
       --prune          With --reap, run 'git worktree prune' on touched repos afterward
       --json           Emit results as JSON (always read-only)
       --dry-run        List only, change nothing (this is the default; kept for habit)
@@ -119,6 +125,9 @@ STATUS FLAGS:
   ${C_GREEN}clean${C_RESET}      No local changes; HEAD exists on a remote -- safe to reap
   ${C_YELLOW}dirty${C_RESET}      Uncommitted or untracked changes present
   ${C_YELLOW}unpushed${C_RESET}   Commits that exist nowhere on a remote
+  ${C_CYAN}busy${C_RESET}       A live process is working in this tree -- leave it alone
+  ${C_DIM}locked${C_RESET}     'git worktree lock' is set; reaping lifts a lock whose
+             owning process is gone (a live owner reads as busy instead)
   ${C_RED}orphan${C_RESET}     Main repository is gone; only the checkout remains
 
 EXAMPLES:
@@ -263,6 +272,126 @@ tilde() {
 }
 
 # ---------------------------------------------------------------------------
+# Live processes
+# ---------------------------------------------------------------------------
+# Is a pid still running? `kill -0` answers for our own processes; it reports
+# EPERM (not "gone") for another user's, so fall back to `ps` before calling a
+# pid dead -- a wrong "dead" here would unlock a worktree someone still holds.
+pid_alive() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$1" 2>/dev/null && return 0
+    ps -p "$1" >/dev/null 2>&1
+}
+
+# Interactive shells parked in a worktree are not work in progress -- a leftover
+# terminal tab would otherwise brand half the fields busy forever. Everything
+# else with a cwd inside a tree (agent, dev server, test watcher, build) counts.
+SHELL_COMMANDS=" sh bash zsh fish tcsh csh ksh dash ash elvish nu nushell pwsh login screen tmux "
+
+# Emit "<pid>\t<command>\t<cwd>" for every running process: /proc on Linux, lsof
+# elsewhere. Silence is a valid answer (no /proc, no lsof, no permission) --
+# busy is an extra guard on top of the git signals, never a prerequisite.
+process_cwds() {
+    local cwd comm d line pid="" cmd=""
+    # REAPER_PROC_DIR points the Linux branch at a fixture so it can be
+    # exercised on hosts without a /proc (the test suite does this); it is an
+    # internal seam, not a public interface.
+    local procdir="${REAPER_PROC_DIR:-/proc}"
+    if [ -r "$procdir/self/cwd" ]; then
+        for d in "$procdir"/[0-9]*; do
+            cwd="$(readlink "$d/cwd" 2>/dev/null)" || continue
+            [ -n "$cwd" ] || continue
+            comm=""
+            IFS= read -r comm < "$d/comm" 2>/dev/null || comm=""
+            printf '%s\t%s\t%s\n' "${d##*/}" "$comm" "$cwd"
+        done
+        return 0
+    fi
+    command -v lsof >/dev/null 2>&1 || return 0
+    # -F pcn gives 'p<pid>' then 'c<command>' per process, then 'n<path>' for its
+    # cwd; +c 0 stops lsof truncating the command to 9 characters, which would
+    # let a long-named binary masquerade as a shell.
+    while IFS= read -r line; do
+        case "$line" in
+            p*) pid="${line#p}" ;;
+            c*) cmd="${line#c}" ;;
+            n*) [ -n "${line#n}" ] && printf '%s\t%s\t%s\n' "$pid" "$cmd" "${line#n}" ;;
+        esac
+    done < <(lsof -w -n -P +c 0 -d cwd -F pcn 2>/dev/null || true)
+}
+
+# Our own chain (gh -> bash running this script) has its cwd wherever the user
+# invoked us -- often inside a worktree being surveyed. Counting ourselves would
+# brand that tree busy and refuse to ever reap it, so walk up and skip our pids.
+self_pid_chain() {
+    local p="$$" chain=" " hops=0
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$hops" -lt 32 ]; do
+        chain="$chain$p "
+        hops=$(( hops + 1 ))
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -cd '[:digit:]')"
+    done
+    printf '%s' "$chain"
+}
+
+# Of the worktree paths given, print those holding a live non-shell process.
+busy_worktrees() {
+    local wts=("$@") phys=() pid cmd cwd wt i p seen=" " self
+    [ ${#wts[@]} -gt 0 ] || return 0
+    # Compare on resolved paths as well as the ones we display: `pwd` keeps
+    # symlinks (/var/folders/...) while the process table reports the target
+    # (/private/var/folders/...), so a worktree reached through a symlinked
+    # root -- /tmp and /var on macOS, plenty of home directories -- would
+    # otherwise never look busy.
+    for wt in "${wts[@]}"; do
+        p="$(cd "$wt" 2>/dev/null && pwd -P)" || p=""
+        phys+=("${p:-$wt}")
+    done
+    self="$(self_pid_chain)"
+    while IFS=$'\t' read -r pid cmd cwd; do
+        [ -n "$cwd" ] || continue
+        case "$self" in *" $pid "*) continue ;; esac
+        case "$SHELL_COMMANDS" in *" $cmd "*) continue ;; esac
+        for i in "${!wts[@]}"; do
+            wt="${wts[$i]}"
+            case "$seen" in *" $wt "*) continue ;; esac
+            case "$cwd" in
+                "$wt"|"$wt"/*|"${phys[$i]}"|"${phys[$i]}"/*)
+                    seen="$seen$wt "; printf '%s\n' "$wt" ;;
+            esac
+        done
+    done < <(process_cwds)
+}
+
+# Fold the busy signal into the collected RECORDS. One process-table scan serves
+# every worktree, so this runs once per invocation rather than per worker.
+annotate_busy() {
+    [ "${#RECORDS[@]}" -gt 0 ] || return 0
+    local rec touched kb branch status path main paths=() busyset=" " b out=()
+    for rec in "${RECORDS[@]}"; do
+        IFS=$'\t' read -r touched kb branch status path main <<<"$rec"
+        paths+=("$path")
+    done
+    while IFS= read -r b; do
+        [ -n "$b" ] && busyset="$busyset$b "
+    done < <(busy_worktrees "${paths[@]}")
+    [ "$busyset" = " " ] && return 0
+    for rec in "${RECORDS[@]}"; do
+        IFS=$'\t' read -r touched kb branch status path main <<<"$rec"
+        case "$busyset" in
+            *" $path "*)
+                case "$status" in
+                    *busy*) ;;                       # already flagged via its lock owner
+                    clean)  status="busy" ;;
+                    *)      status="busy $status" ;;
+                esac
+                ;;
+        esac
+        out+=("$touched"$'\t'"$kb"$'\t'"$branch"$'\t'"$status"$'\t'"$path"$'\t'"$main")
+    done
+    RECORDS=("${out[@]}")
+}
+
+# ---------------------------------------------------------------------------
 # Scan roots
 # ---------------------------------------------------------------------------
 # Directories that trigger macOS TCC permission dialogs or are pure noise.
@@ -389,7 +518,28 @@ inspect_marker() {
     # worktree's apparent age. Orphans (no usable git) fall back to the working-
     # dir / reflog mtime, since git can't enumerate the tree there.
     local kb touched dir_m logs_m branch status main
-    local dirty=0 unpushed=0 merged=0 prmerged=0
+    local dirty=0 unpushed=0 merged=0 prmerged=0 locked=0 busy=0
+
+    # `git worktree lock` writes its reason to <gitdir>/locked. Agent harnesses
+    # lock the tree for the duration of a session and stamp the reason with their
+    # pid; if that session dies the lock outlives it and `git worktree remove`
+    # refuses the tree forever (only 'remove -f -f' overrides). Distinguish the
+    # two cases: a lock whose owner is still running means real work is under
+    # way (busy), a lock whose owner is gone is just debris to lift on reap.
+    if [ -f "$gitdir/locked" ]; then
+        locked=1
+        local lock_reason="" lock_pid=""
+        IFS= read -r lock_reason < "$gitdir/locked" 2>/dev/null || lock_reason=""
+        # Anchor on "(pid N" / " pid N" so a reason like "rapid 5 retries"
+        # can't be mined for a bogus pid.
+        case "$lock_reason" in
+            pid\ [0-9]*|*[\ \(]pid\ [0-9]*)
+                lock_pid="${lock_reason#*pid }"
+                lock_pid="${lock_pid%%[![:digit:]]*}"
+                ;;
+        esac
+        [ -n "$lock_pid" ] && pid_alive "$lock_pid" && busy=1
+    fi
     # No pipe into an early-exit filter here: on a big tree `du` is still
     # writing when the reader quits, and SIGPIPE + pipefail would kill us.
     kb="$(du -sk "$wt" 2>/dev/null)" || kb=""
@@ -478,8 +628,10 @@ inspect_marker() {
     if [ "${status:-}" != "orphan" ]; then
         if [ "$merged" = 1 ] || [ "$prmerged" = 1 ]; then unpushed=0; fi
         status=""
-        [ "$dirty" = 1 ] && status="dirty"
+        [ "$busy" = 1 ] && status="busy"
+        [ "$dirty" = 1 ] && status="${status:+$status }dirty"
         [ "$unpushed" = 1 ] && status="${status:+$status }unpushed"
+        [ "$locked" = 1 ] && status="${status:+$status }locked"
         if [ "$prmerged" = 1 ]; then status="${status:+$status }pr-merged"
         elif [ "$merged" = 1 ]; then status="${status:+$status }merged"; fi
         [ -z "$status" ] && status="clean"
@@ -491,7 +643,10 @@ inspect_marker() {
 # ---------------------------------------------------------------------------
 # Reaping
 # ---------------------------------------------------------------------------
-is_risky() { case "$1" in *dirty*|*unpushed*|*orphan*) return 0 ;; *) return 1 ;; esac; }
+# `locked` is deliberately absent: a lock whose owner died is exactly the debris
+# this tool exists to clear, and reap_one lifts it. A lock still held reads as
+# `busy` instead, which does gate on --force.
+is_risky() { case "$1" in *busy*|*dirty*|*unpushed*|*orphan*) return 0 ;; *) return 1 ;; esac; }
 
 reap_one() {
     local wt="$1" main="$2" status="$3"
@@ -499,6 +654,12 @@ reap_one() {
         rm -rf "$wt"
         return $?
     fi
+    # Lift a stale lock first. `git worktree remove --force` does NOT override a
+    # lock -- git demands 'remove -f -f' -- and we have already judged this tree
+    # reapable, so unlock rather than escalating to double force.
+    case "$status" in
+        *locked*) git -C "$main" worktree unlock "$wt" >/dev/null 2>&1 || true ;;
+    esac
     local args=(worktree remove)
     # Risky statuses force by classification. A worktree we already judged
     # reapable (clean/merged) can still carry ignored lock-file churn or an agent
@@ -569,6 +730,11 @@ main() {
         rm -rf "$outdir"
     fi
 
+    # Flag the worktrees a live process is sitting in. Done here, once, rather
+    # than inside the parallel workers: a single process-table scan answers for
+    # every worktree at once.
+    annotate_busy
+
     # ---- filter + sort (oldest first) ----
     local filtered=()
     local rec touched kb branch status path main age
@@ -602,6 +768,8 @@ main() {
             map({
               path: .[4], branch: .[2], status: .[3],
               merged: (.[3]|test("merged")),
+              busy: (.[3]|test("busy")),
+              locked: (.[3]|test("locked")),
               sizeKb: (.[1]|tonumber),
               touched: (.[0]|tonumber),
               ageDays: (($now - (.[0]|tonumber)) / 86400 | floor),
@@ -618,7 +786,9 @@ main() {
         age=$(( NOW - touched ))
         total_kb=$(( total_kb + kb ))
         local color="$C_DIM"
+        # Busy first: a busy tree can also be merged, and must not read green.
         case "$status" in
+            *busy*)              color="$C_CYAN" ;;
             *orphan*)            color="$C_RED" ;;
             *dirty*|*unpushed*)  color="$C_YELLOW" ;;
             *merged*|clean)      color="$C_GREEN" ;;

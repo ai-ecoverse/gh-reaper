@@ -3,6 +3,36 @@
 All notable changes to `gh-reaper` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] - 2026-08-07
+
+### Added
+- **`busy` — never sweep a worktree someone is working in.** A worktree whose
+  branch is merged still reads as reapable while a coding agent is running
+  inside it, so `gh reaper --merged --reap --yes` would delete an active session
+  out from under itself. Found in the field: a 20-hour agent run classified as
+  plain `merged`, one flag away from being swept. A worktree now reads `busy`
+  when a live process has its current directory inside the tree, and `busy` is
+  risky — skipped unless you pass `--force`. One process-table scan per run
+  (`/proc` on Linux, `lsof` elsewhere, ~0.5s) covers every worktree at once.
+  Idle interactive shells are deliberately excluded: a terminal tab parked in a
+  finished worktree is not work in progress, and counting it would pin half the
+  fields forever. `gh reaper`'s own process chain is excluded too, so running it
+  from inside a worktree doesn't make that worktree un-reapable.
+
+### Fixed
+- **A stale `git worktree lock` no longer pins a worktree forever.** Agent
+  harnesses lock the tree for a session and stamp the reason with their pid
+  (`claude session foo (pid 832 …)`); if that session dies the lock outlives it,
+  and `git worktree remove` refuses the tree outright — `--force` does *not*
+  override a lock, only `remove -f -f` does. Reaping now reads the lock reason,
+  and lifts the lock with `git worktree unlock` when its owning process is gone.
+  A lock whose owner is still alive reads as `busy` instead and is spared. Both
+  states surface as a `locked` status flag and a `locked` JSON field.
+- **Busy detection sees through symlinked roots.** The process table reports
+  resolved paths (`/private/var/…`) while `pwd` keeps the symlink (`/var/…`), so
+  worktrees under `/tmp`, `/var`, or a symlinked home would never have looked
+  busy. Paths are now compared in both forms.
+
 ## [1.6.0] - 2026-06-08
 
 ### Added

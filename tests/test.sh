@@ -331,6 +331,203 @@ if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
+# Busy: a live process working inside a worktree pins it, however merged the
+# branch is. This is the "agent mid-run" guard -- `--merged --reap --yes` must
+# not sweep a tree someone is still in. Idle interactive shells are excluded,
+# or every leftover terminal tab would pin a finished worktree forever.
+# ---------------------------------------------------------------------------
+if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    BSBX="$(mktemp -d)/busy"; mkdir -p "$BSBX"
+    BUSY_PIDS=()
+    (
+        cd "$BSBX" || exit 1
+        g init --bare remote.git >/dev/null
+        g init repo >/dev/null
+        cd repo || exit 1
+        g remote add origin "$BSBX/remote.git"
+        echo hi > a.txt; g add a.txt; g commit -qm init
+        g push -q -u origin main
+        g remote set-head origin main
+
+        # two merged worktrees: one will host a worker, one an idle shell
+        for n in busy shell; do
+            g worktree add -q "../wt-$n" -b "feat-$n"
+            ( cd "../wt-$n" && echo x > "$n.txt" && g add "$n.txt" && g commit -qm "feature $n" )
+            g merge -q --no-ff "feat-$n" -m "merge feat-$n"
+        done
+        g push -q origin main
+    ) >/dev/null 2>&1
+
+    # A non-shell worker (sleep) parked inside wt-busy.
+    ( cd "$BSBX/wt-busy" && exec sleep 120 ) &
+    BUSY_PIDS+=("$!")
+    # An interactive-shell stand-in inside wt-shell: bash blocked on a read, with
+    # no child of its own (a plain `bash -c sleep` would exec into `sleep` and
+    # defeat the point). The fifo is opened read-write so the open doesn't block.
+    mkfifo "$BSBX/hold" 2>/dev/null || true
+    ( cd "$BSBX/wt-shell" && exec bash -c 'read -r _ <&3' 3<>"$BSBX/hold" ) &
+    BUSY_PIDS+=("$!")
+    sleep 1  # let the processes settle so the process table sees their cwd
+
+    bstatusof() { "$REAPER" --json --path "$BSBX" 2>/dev/null \
+        | jq -r --arg b "$1" '.[]|select(.branch==$b)|.status' 2>/dev/null; }
+
+    check  # live worker pins an otherwise-sweepable merged worktree
+    s="$(bstatusof feat-busy)"
+    [ "$s" = "busy merged" ] && ok "live process marks a merged worktree busy" \
+        || no "live process marks a merged worktree busy" "got: $s"
+
+    check  # busy exposed as a JSON boolean for scripting
+    b="$("$REAPER" --json --path "$BSBX" 2>/dev/null \
+        | jq -r 'map(select(.busy))|.[].branch' 2>/dev/null)"
+    [ "$b" = "feat-busy" ] && ok "busy boolean flags only the occupied worktree" \
+        || no "busy boolean flags only the occupied worktree" "got: $b"
+
+    check  # a parked shell is not work in progress
+    s="$(bstatusof feat-shell)"
+    [ "$s" = "merged" ] && ok "idle shell does not mark a worktree busy" \
+        || no "idle shell does not mark a worktree busy" "got: $s"
+
+    check  # the headline guard: --merged --reap --yes must skip the busy one
+    "$REAPER" --reap --yes --merged --no-color --path "$BSBX" >/dev/null 2>&1
+    if [ -d "$BSBX/wt-busy" ] && [ ! -d "$BSBX/wt-shell" ]; then
+        ok "--merged --reap spares busy, sweeps the idle one"
+    else
+        no "--merged --reap spares busy, sweeps the idle one" \
+           "wt-busy=$([ -d "$BSBX/wt-busy" ]&&echo y||echo n) wt-shell=$([ -d "$BSBX/wt-shell" ]&&echo y||echo n)"
+    fi
+
+    check  # --force is the documented override
+    "$REAPER" --reap --yes --force --no-color --path "$BSBX" >/dev/null 2>&1
+    [ ! -d "$BSBX/wt-busy" ] && ok "--force reaps a busy worktree" \
+        || no "--force reaps a busy worktree" "wt-busy survived --force"
+
+    for p in "${BUSY_PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    wait 2>/dev/null
+    rm -rf "$(dirname "$BSBX")"
+fi
+
+# ---------------------------------------------------------------------------
+# The Linux busy path reads /proc directly rather than shelling out to lsof.
+# Drive it from a fixture so it is covered on any host, not only on Linux --
+# otherwise the branch CI actually runs is the one never exercised locally.
+# ---------------------------------------------------------------------------
+if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    PSBX="$(mktemp -d)/proc"; mkdir -p "$PSBX"
+    (
+        cd "$PSBX" || exit 1
+        g init --bare remote.git >/dev/null
+        g init repo >/dev/null
+        cd repo || exit 1
+        g remote add origin "$PSBX/remote.git"
+        echo hi > a.txt; g add a.txt; g commit -qm init
+        g push -q -u origin main
+        g remote set-head origin main
+        for n in worker shell; do
+            g worktree add -q "../wt-$n" -b "feat-$n"
+            ( cd "../wt-$n" && echo x > "$n.txt" && g add "$n.txt" && g commit -qm "feature $n" )
+            g merge -q --no-ff "feat-$n" -m "merge feat-$n"
+        done
+        g push -q origin main
+    ) >/dev/null 2>&1
+
+    # A stand-in /proc: one non-shell process in wt-worker, one shell in
+    # wt-shell. Pids are far above any real one so they can't collide with our
+    # own process chain. cwd symlinks point at resolved paths, as Linux reports.
+    FAKEPROC="$PSBX/fakeproc"
+    mkdir -p "$FAKEPROC/self" "$FAKEPROC/999001" "$FAKEPROC/999002"
+    ln -s "$PSBX" "$FAKEPROC/self/cwd"
+    ln -s "$(cd "$PSBX/wt-worker" && pwd -P)" "$FAKEPROC/999001/cwd"
+    printf 'node\n' > "$FAKEPROC/999001/comm"
+    ln -s "$(cd "$PSBX/wt-shell" && pwd -P)" "$FAKEPROC/999002/cwd"
+    printf 'zsh\n' > "$FAKEPROC/999002/comm"
+
+    pstatusof() { REAPER_PROC_DIR="$FAKEPROC" "$REAPER" --json --path "$PSBX" 2>/dev/null \
+        | jq -r --arg b "$1" '.[]|select(.branch==$b)|.status' 2>/dev/null; }
+
+    check  # /proc branch flags the non-shell process
+    s="$(pstatusof feat-worker)"
+    [ "$s" = "busy merged" ] && ok "/proc path marks a worktree busy" \
+        || no "/proc path marks a worktree busy" "got: $s"
+
+    check  # /proc branch honours the shell exclusion
+    s="$(pstatusof feat-shell)"
+    [ "$s" = "merged" ] && ok "/proc path excludes shells" \
+        || no "/proc path excludes shells" "got: $s"
+
+    rm -rf "$(dirname "$PSBX")"
+fi
+
+# ---------------------------------------------------------------------------
+# Locks: `git worktree remove` refuses a locked tree outright (only 'remove
+# -f -f' overrides), so a lock left behind by a crashed session pins the
+# worktree forever. A lock whose owning pid is gone is debris -- reaping lifts
+# it. A lock whose owner is alive means someone is really in there: busy.
+# ---------------------------------------------------------------------------
+if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    KSBX="$(mktemp -d)/lock2"; mkdir -p "$KSBX"
+
+    # A definitely-dead pid: spawn, kill, reap. (Picking a number risks
+    # colliding with a live process.)
+    sleep 120 & DEAD_PID=$!
+    kill "$DEAD_PID" 2>/dev/null; wait "$DEAD_PID" 2>/dev/null
+    # A definitely-live pid, deliberately parked OUTSIDE any worktree so only
+    # the lock-owner path can flag it busy, not the cwd scan.
+    sleep 120 & LIVE_PID=$!
+
+    (
+        cd "$KSBX" || exit 1
+        g init --bare remote.git >/dev/null
+        g init repo >/dev/null
+        cd repo || exit 1
+        g remote add origin "$KSBX/remote.git"
+        echo hi > a.txt; g add a.txt; g commit -qm init
+        g push -q -u origin main
+        g remote set-head origin main
+
+        for n in stale live; do
+            g worktree add -q "../wt-$n" -b "feat-$n"
+            ( cd "../wt-$n" && echo x > "$n.txt" && g add "$n.txt" && g commit -qm "feature $n" )
+            g merge -q --no-ff "feat-$n" -m "merge feat-$n"
+        done
+        g push -q origin main
+
+        g worktree lock --reason "agent session alpha (pid $DEAD_PID start Mon)" ../wt-stale
+        g worktree lock --reason "agent session beta (pid $LIVE_PID start Mon)"  ../wt-live
+    ) >/dev/null 2>&1
+
+    kstatusof() { "$REAPER" --json --path "$KSBX" 2>/dev/null \
+        | jq -r --arg b "$1" '.[]|select(.branch==$b)|.status' 2>/dev/null; }
+
+    check  # dead owner -> locked, but not busy
+    s="$(kstatusof feat-stale)"
+    [ "$s" = "locked merged" ] && ok "stale lock reports locked, not busy" \
+        || no "stale lock reports locked, not busy" "got: $s"
+
+    check  # live owner -> busy
+    s="$(kstatusof feat-live)"
+    [ "$s" = "busy locked merged" ] && ok "live lock owner marks the worktree busy" \
+        || no "live lock owner marks the worktree busy" "got: $s"
+
+    check  # locked exposed as a JSON boolean
+    n="$("$REAPER" --json --path "$KSBX" 2>/dev/null | jq -r 'map(select(.locked))|length' 2>/dev/null)"
+    [ "$n" = 2 ] && ok "locked boolean set on both locked worktrees" \
+        || no "locked boolean set on both locked worktrees" "got: $n"
+
+    check  # the headline fix: a stale lock no longer blocks reaping
+    "$REAPER" --reap --yes --merged --no-color --path "$KSBX" >/dev/null 2>&1
+    if [ ! -d "$KSBX/wt-stale" ] && [ -d "$KSBX/wt-live" ]; then
+        ok "reaping lifts a stale lock; a held lock is spared"
+    else
+        no "reaping lifts a stale lock; a held lock is spared" \
+           "wt-stale=$([ -d "$KSBX/wt-stale" ]&&echo y||echo n) wt-live=$([ -d "$KSBX/wt-live" ]&&echo y||echo n)"
+    fi
+
+    kill "$LIVE_PID" 2>/dev/null; wait 2>/dev/null
+    rm -rf "$(dirname "$KSBX")"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 printf "Tests run: %d   ${GREEN}passed: %d${NC}   ${RED}failed: %d${NC}\n" "$RUN" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
