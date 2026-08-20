@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # gh-reaper - GitHub CLI extension that harvests stale git worktrees
-# Version: 1.7.0
+# Version: 1.8.0
 # https://github.com/ai-ecoverse/gh-reaper
 #
 # Seasons don't fear the reaper. Nor do your forgotten worktrees -- until now.
@@ -11,8 +11,12 @@
 
 set -euo pipefail
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 EXTENSION_NAME="gh-reaper"
+
+# Space-delimited, space-padded list of the roots this run scans. Consulted when
+# reaping, to know which directories are containers we own and which are yours.
+SCAN_ROOTS=" "
 
 # Absolute path to this script, so we can re-invoke ourselves as parallel
 # inspection workers (see the --__inspect dispatch at the bottom).
@@ -464,6 +468,16 @@ resolve_roots() {
             "$HOME/worktrees" "$HOME/.worktrees"
             "$HOME/go/src"
         )
+        # bb (getbb.app) parks every managed worktree environment under its data
+        # directory as <data-dir>/worktrees/<env-id>/<repo>, one env dir per
+        # environment -- outside any code root, so nothing above would find them.
+        # The data dir is $HOME/.bb by default, $HOME/.bb-dev for a dev build,
+        # and $BB_DATA_DIR when set; list all three and let the existence check
+        # and dedupe below sort it out.
+        maybe+=( "$HOME/.bb/worktrees" "$HOME/.bb-dev/worktrees" )
+        if [ -n "${BB_DATA_DIR:-}" ]; then
+            maybe+=( "$BB_DATA_DIR/worktrees" )
+        fi
         for r in "${maybe[@]}"; do [ -d "$r" ] && candidates+=("$r"); done
     fi
 
@@ -648,11 +662,25 @@ inspect_marker() {
 # `busy` instead, which does gate on --force.
 is_risky() { case "$1" in *busy*|*dirty*|*unpushed*|*orphan*) return 0 ;; *) return 1 ;; esac; }
 
+# Removing a worktree can leave its parent directory behind, empty. Harnesses
+# that give every session its own container dir -- bb's
+# <data-dir>/worktrees/<env-id>/<repo>, Conductor's <repo>/.conductor/<name> --
+# would otherwise accumulate one empty husk per tree reaped. Drop the parent
+# only when it is empty *and* is not itself a scan root, so a directory you
+# created on purpose (~/worktrees, ~/Developer) never vanishes under you.
+prune_empty_parent() {
+    local parent; parent="$(dirname "$1")"
+    case "$parent" in /|"$HOME") return 0 ;; esac
+    case "$SCAN_ROOTS" in *" $parent "*) return 0 ;; esac
+    rmdir "$parent" 2>/dev/null || true
+}
+
 reap_one() {
     local wt="$1" main="$2" status="$3"
     if [ "$status" = "orphan" ] || [ -z "$main" ]; then
-        rm -rf "$wt"
-        return $?
+        rm -rf "$wt" || return 1
+        prune_empty_parent "$wt"
+        return 0
     fi
     # Lift a stale lock first. `git worktree remove --force` does NOT override a
     # lock -- git demands 'remove -f -f' -- and we have already judged this tree
@@ -669,7 +697,11 @@ reap_one() {
         args+=(--force)
     fi
     args+=("$wt")
-    git -C "$main" "${args[@]}" 2>&1
+    local out rc=0
+    out="$(git -C "$main" "${args[@]}" 2>&1)" || rc=$?
+    [ "$rc" -eq 0 ] && prune_empty_parent "$wt"
+    printf '%s' "$out"
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -688,6 +720,7 @@ main() {
     # ---- discover ----
     local roots=(); local root
     while IFS= read -r root; do roots+=("$root"); done < <(resolve_roots)
+    for root in "${roots[@]:-}"; do [ -n "$root" ] && SCAN_ROOTS="$SCAN_ROOTS$root "; done
     if [ ${#roots[@]} -eq 0 ]; then
         echo "No scannable directories found. Pass a PATH or use --all." >&2
         exit 1

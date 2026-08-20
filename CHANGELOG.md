@@ -3,6 +3,29 @@
 All notable changes to `gh-reaper` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8.0] - 2026-08-19
+
+### Added
+- **Finds bb's worktrees.** [bb](https://getbb.app) parks every managed worktree
+  environment under its own data directory —
+  `<data-dir>/worktrees/<env-id>/<repo>`, one container dir per environment —
+  which is under a dotfile directory in `$HOME` and so sat outside every code
+  root gh-reaper walked. A machine running bb could accumulate a worktree per
+  thread and `gh reaper` would report none of them. `~/.bb/worktrees` (and
+  `~/.bb-dev/worktrees` for a dev build) is now a curated default root, and
+  `$BB_DATA_DIR` is honored when set, so a relocated data directory is found
+  too.
+
+### Fixed
+- **An emptied container directory no longer outlives the worktree it held.**
+  Harnesses that give each session its own wrapper dir — bb's `<env-id>/`,
+  Conductor's `.conductor/` — used to leave one empty husk behind per tree
+  reaped, so sweeping a machine's bb worktrees traded a pile of checkouts for a
+  pile of empty directories. Reaping now removes a parent left empty by the
+  removal. A directory that is itself a scan root (`~/worktrees`, `~/Developer`,
+  or anything you passed with `--path`) is never removed, so a directory you
+  created on purpose can't vanish because its last worktree was swept.
+
 ## [1.7.0] - 2026-08-07
 
 ### Added

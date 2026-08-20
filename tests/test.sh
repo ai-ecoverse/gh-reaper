@@ -528,6 +528,66 @@ if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
+# bb (getbb.app) worktrees: <data-dir>/worktrees/<env-id>/<repo>. The data dir
+# lives outside every code root, so discovery has to know about it by name;
+# reaping has to clear the now-empty <env-id> container it leaves behind.
+# ---------------------------------------------------------------------------
+if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    BSBX="$(mktemp -d)/bb"; mkdir -p "$BSBX/elsewhere"
+    (
+        cd "$BSBX" || exit 1
+        g init --bare remote.git >/dev/null
+        g init repo >/dev/null
+        cd repo || exit 1
+        g remote add origin "$BSBX/remote.git"
+        echo hi > a.txt; g add a.txt; g commit -qm init
+        g push -q -u origin main
+        g remote set-head origin main
+        # Default data dir ($HOME/.bb) and an explicit $BB_DATA_DIR one.
+        mkdir -p "$BSBX/.bb/worktrees/env_aaa" "$BSBX/custom/worktrees/env_bbb"
+        g worktree add -q "$BSBX/.bb/worktrees/env_aaa/repo" -b feat-bb-default
+        g worktree add -q "$BSBX/custom/worktrees/env_bbb/repo" -b feat-bb-custom
+        g push -q -u origin feat-bb-default
+        g push -q -u origin feat-bb-custom
+    ) >/dev/null 2>&1
+
+    check  # found with no --path at all: the root has to be a curated default
+    branches="$(cd "$BSBX/elsewhere" && HOME="$BSBX" "$REAPER" --json 2>/dev/null \
+        | jq -r '.[].branch' 2>/dev/null | sort | tr '\n' ',')"
+    [ "$branches" = "feat-bb-default," ] \
+        && ok "scans bb's default data dir (~/.bb/worktrees)" \
+        || no "scans bb's default data dir (~/.bb/worktrees)" "got: $branches"
+
+    check  # $BB_DATA_DIR relocates it
+    branches="$(cd "$BSBX/elsewhere" && HOME="$BSBX" BB_DATA_DIR="$BSBX/custom" \
+        "$REAPER" --json 2>/dev/null | jq -r '.[].branch' 2>/dev/null | sort | tr '\n' ',')"
+    [ "$branches" = "feat-bb-custom,feat-bb-default," ] \
+        && ok "honors \$BB_DATA_DIR" \
+        || no "honors \$BB_DATA_DIR" "got: $branches"
+
+    check  # reaping clears the empty <env-id> husk but never the root itself
+    ( cd "$BSBX/elsewhere" && HOME="$BSBX" "$REAPER" --reap --yes --no-color ) >/dev/null 2>&1
+    if [ ! -d "$BSBX/.bb/worktrees/env_aaa" ] && [ -d "$BSBX/.bb/worktrees" ]; then
+        ok "reaping removes the emptied env dir, keeps the scan root"
+    else
+        no "reaping removes the emptied env dir, keeps the scan root" \
+           "env_aaa=$([ -d "$BSBX/.bb/worktrees/env_aaa" ]&&echo y||echo n) root=$([ -d "$BSBX/.bb/worktrees" ]&&echo y||echo n)"
+    fi
+
+    check  # a scan root passed explicitly is never rmdir'd out from under you
+    ( cd "$BSBX/elsewhere" && HOME="$BSBX" "$REAPER" --reap --yes --no-color \
+        --path "$BSBX/custom/worktrees/env_bbb" ) >/dev/null 2>&1
+    if [ ! -d "$BSBX/custom/worktrees/env_bbb/repo" ] && [ -d "$BSBX/custom/worktrees/env_bbb" ]; then
+        ok "an explicit scan root survives reaping its last worktree"
+    else
+        no "an explicit scan root survives reaping its last worktree" \
+           "wt=$([ -d "$BSBX/custom/worktrees/env_bbb/repo" ]&&echo y||echo n) root=$([ -d "$BSBX/custom/worktrees/env_bbb" ]&&echo y||echo n)"
+    fi
+
+    rm -rf "$(dirname "$BSBX")"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 printf "Tests run: %d   ${GREEN}passed: %d${NC}   ${RED}failed: %d${NC}\n" "$RUN" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
