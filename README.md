@@ -170,7 +170,8 @@ So for every bb-managed worktree, gh reaper asks bb:
 - **Fail safe:** if `bb` isn't installed, errors, or returns something
   unexpected (or `jq` is missing), *every* bb-managed worktree reads `bb-live`
   and a single warning goes to stderr. "Thread not found" counts as deleted only
-  for worktrees under the data dir that this `bb` serves (`bb status`). A dev
+  for worktrees under the data dir that this `bb` serves (`bb status`). If that
+  can't be determined, an unlisted thread is treated as live. A dev
   build's threads are unknown to the release CLI, which doesn't make them
   deleted.
 

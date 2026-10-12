@@ -499,10 +499,9 @@ bb_load_threads() {
     done <<<"$keys"
     # The data dir this bb serves. "No such thread" is only proof of deletion
     # for worktrees under it -- a dev build's threads are unknown to the release
-    # CLI, not deleted.
+    # CLI, not deleted. No answer means no such proof anywhere: never guess.
     BB_CLI_DATA_DIR="$("$BB_BIN" status --json 2>/dev/null | jq -r '.dataDir // empty' 2>/dev/null)" \
         || BB_CLI_DATA_DIR=""
-    [ -n "$BB_CLI_DATA_DIR" ] || BB_CLI_DATA_DIR="${BB_DATA_DIR:-$HOME/.bb}"
     BB_CLI_DATA_DIR="${BB_CLI_DATA_DIR%/}"
     return 0
 }
@@ -510,6 +509,7 @@ bb_load_threads() {
 # Is PATH under the data dir the bb CLI serves?
 bb_served_by_cli() {
     local p d
+    [ -n "$BB_CLI_DATA_DIR" ] || return 1
     while IFS= read -r p; do
         while IFS= read -r d; do
             case "$p" in "$d"/*) return 0 ;; esac

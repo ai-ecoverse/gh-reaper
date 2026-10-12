@@ -55,7 +55,7 @@ case "$1 $2" in
     "thread show")
         if [ -f "${STUB_BB_SHOW_DIR:-/nonexistent}/$3.json" ]; then cat "$STUB_BB_SHOW_DIR/$3.json"
         else echo '{"ok": false, "error": {"code": "thread_not_found", "message": "HTTP 404: Thread not found"}}'; exit 1; fi ;;
-    "status --json") printf '{"dataDir": "%s"}\n' "${STUB_BB_DATA_DIR:-$HOME/.bb}" ;;
+    "status --json") [ -n "${STUB_BB_NO_STATUS:-}" ] && exit 1; printf '{"dataDir": "%s"}\n' "${STUB_BB_DATA_DIR:-$HOME/.bb}" ;;
     *) echo '{"ok": false, "error": {"code": "usage"}}'; exit 1 ;;
 esac
 STUB
@@ -790,6 +790,13 @@ JSON
     s="$(nbb "$S3" --json 2>/dev/null | jq -r 'map(select(.bbLive))|length')"
     [ "$s" = 6 ] && ok "malformed bb output: every bb-managed worktree is bb-live" \
         || no "malformed bb output: every bb-managed worktree is bb-live" "got: $s"
+
+    check  # no `bb status` dataDir: "not found" proves nothing, so it stays live
+    S5="$NTOP/s5"; make_bb_fixture "$S5"
+    STUB_BB_NO_STATUS=1 nbb "$S5" --reap --yes --force --no-color >/dev/null 2>&1
+    got="$(alive "$S5/$BBWT/thr_gone1-1/repo" "$S5/$BBWT/thr_live1-1/repo" "$S5/$BBWT/thr_arch1-1/repo")"
+    [ "$got" = "y y n" ] && ok "without bb's data dir, an unlisted thread's worktree is bb-live" \
+        || no "without bb's data dir, an unlisted thread's worktree is bb-live" "gone1 live1 arch1 = $got"
 
     check  # $BB_DATA_DIR: the current layout under a relocated data dir
     S4="$NTOP/s4"; make_bb_fixture "$S4"
