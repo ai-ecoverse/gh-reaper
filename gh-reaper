@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # gh-reaper - GitHub CLI extension that harvests stale git worktrees
-# Version: 1.8.0
+# Version: 1.9.0
 # https://github.com/ai-ecoverse/gh-reaper
 #
 # Seasons don't fear the reaper. Nor do your forgotten worktrees -- until now.
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-VERSION="1.8.0"
+VERSION="1.9.0"
 EXTENSION_NAME="gh-reaper"
 
 # Space-delimited, space-padded list of the roots this run scans. Consulted when
@@ -98,6 +98,12 @@ DESCRIPTION:
   tree. Busy worktrees are never swept without --force, however merged they
   look. Idle interactive shells don't count.
 
+  A worktree bb (getbb.app) manages whose thread is still open is BB-LIVE: bb
+  asks it for the thread's next turn, merged branch or not. gh reaper asks the
+  'bb' CLI once per run; bb-live worktrees are never reaped, not even with
+  --force. Archive the thread in bb to release its worktree. If bb can't be
+  asked, every bb-managed worktree counts as bb-live.
+
 OPTIONS:
   -r, --reap           Delete worktrees (interactive unless --yes). Without this,
                        gh reaper only lists -- it never removes anything.
@@ -115,7 +121,7 @@ OPTIONS:
   -a, --all            Scan all of \$HOME (still skips TCC-protected dirs)
   -y, --yes            With --reap, delete without prompting for each worktree
   -f, --force          With --reap, also remove dirty, unpushed, busy, or
-                       orphaned worktrees
+                       orphaned worktrees (never bb-live ones)
       --prune          With --reap, run 'git worktree prune' on touched repos afterward
       --json           Emit results as JSON (always read-only)
       --dry-run        List only, change nothing (this is the default; kept for habit)
@@ -130,6 +136,7 @@ STATUS FLAGS:
   ${C_YELLOW}dirty${C_RESET}      Uncommitted or untracked changes present
   ${C_YELLOW}unpushed${C_RESET}   Commits that exist nowhere on a remote
   ${C_CYAN}busy${C_RESET}       A live process is working in this tree -- leave it alone
+  ${C_CYAN}bb-live${C_RESET}    Worktree of an open bb thread -- never reaped, even with --force
   ${C_DIM}locked${C_RESET}     'git worktree lock' is set; reaping lifts a lock whose
              owning process is gone (a live owner reads as busy instead)
   ${C_RED}orphan${C_RESET}     Main repository is gone; only the checkout remains
@@ -396,6 +403,191 @@ annotate_busy() {
 }
 
 # ---------------------------------------------------------------------------
+# bb (getbb.app) thread lifecycle
+# ---------------------------------------------------------------------------
+# bb gives every thread its own worktree environment and keeps it for as long as
+# the thread is open -- not for as long as its branch is unmerged. A thread whose
+# PR has merged still reads `merged clean`, yet its next turn runs in that tree;
+# reap it and bb can't restore it (one `--merged --reap` swept nine live
+# threads this way). So a bb-managed worktree is checked against bb itself: one
+# whose thread is still open reads `bb-live` and is never reaped, not even with
+# --force. Only a worktree whose thread bb confirms archived or deleted goes on to
+# the usual rules. If bb can't be asked, every bb worktree is `bb-live`.
+
+# Where current bb keeps worktree environments, relative to its data dir.
+BB_WT_SUBDIR="plugins/environment-git-worktree/host-data/worktrees"
+
+# Candidate bb data dirs: $BB_DATA_DIR, the default, and a dev build's.
+bb_data_dirs() {
+    [ -n "${BB_DATA_DIR:-}" ] && printf '%s\n' "${BB_DATA_DIR%/}"
+    printf '%s\n' "$HOME/.bb" "$HOME/.bb-dev"
+}
+
+# The path, plus its symlink-resolved form when that differs.
+path_forms() {
+    local p="$1" r
+    printf '%s\n' "$p"
+    r="$(cd "$p" 2>/dev/null && pwd -P)" || r=""
+    [ -n "$r" ] && [ "$r" != "$p" ] && printf '%s\n' "$r"
+    return 0
+}
+
+# If PATH is a bb-managed worktree, print its env dir name (the directory right
+# below bb's worktrees dir: thr_<id>-<n> today, env_<id> on older bb) and
+# succeed. The current layout is recognized under any data dir, so a relocated
+# one is still protected; the old, generic-looking <data-dir>/worktrees/ only
+# under a known data dir.
+bb_env_dir_of() {
+    local p dd rest=""
+    while IFS= read -r p; do
+        case "$p" in
+            */"$BB_WT_SUBDIR"/?*) rest="${p##*/"$BB_WT_SUBDIR"/}" ;;
+            *)
+                while IFS= read -r dd; do
+                    case "$p" in "$dd"/worktrees/?*) rest="${p#"$dd"/worktrees/}"; break ;; esac
+                done < <(bb_data_dirs)
+                ;;
+        esac
+        [ -n "$rest" ] && break
+    done < <(path_forms "$1")
+    [ -n "$rest" ] || return 1
+    printf '%s\n' "${rest%%/*}"
+}
+
+# The bb CLI to ask: `bb` on PATH, else the daemon-managed $BB_CLI.
+bb_cli() {
+    local b
+    b="$(command -v bb 2>/dev/null)" || b=""
+    [ -z "$b" ] && [ -n "${BB_CLI:-}" ] && [ -x "$BB_CLI" ] && b="$BB_CLI"
+    [ -n "$b" ] || return 1
+    printf '%s\n' "$b"
+}
+
+# Space-padded key sets filled by bb_load_threads: ids of open threads, of their
+# environments, and the env dir names they run in (BB_LIVE); the same for
+# archived / deleted threads (BB_GONE).
+BB_LIVE=" "; BB_GONE=" "; BB_CLI_DATA_DIR=""; BB_FAIL=""; BB_BIN=""
+
+# Ask bb for every thread it knows -- open and archived, hidden included -- in
+# two list calls. On any failure set BB_FAIL to the reason and return 1.
+bb_load_threads() {
+    BB_BIN="$(bb_cli)" || { BB_FAIL="the bb CLI is not installed"; return 1; }
+    command -v jq >/dev/null 2>&1 || { BB_FAIL="jq is not installed"; return 1; }
+    local open arch keys state key
+    open="$("$BB_BIN" thread list --json --include-hidden 2>/dev/null)" \
+        || open="$("$BB_BIN" thread list --json 2>/dev/null)" \
+        || { BB_FAIL="'bb thread list' failed"; return 1; }
+    arch="$("$BB_BIN" thread list --json --archived --include-hidden 2>/dev/null)" \
+        || arch="$("$BB_BIN" thread list --json --archived 2>/dev/null)" \
+        || { BB_FAIL="'bb thread list --archived' failed"; return 1; }
+    # Both must be bare arrays; a failure envelope is an object. Fed on stdin:
+    # a busy bb's thread list is megabytes, past ARG_MAX as an argument.
+    keys="$(printf '%s\n%s\n' "$open" "$arch" | jq -rs --arg sub "$BB_WT_SUBDIR" '
+        if length != 2 or (.[0]|type) != "array" or (.[1]|type) != "array"
+        then error("shape") else . end |
+        (.[0] + .[1])[] |
+        (if .archivedAt == null and .deletedAt == null then "live" else "gone" end) as $s |
+        ((.environmentPath // "") as $p |
+            if ($p|index("/" + $sub + "/")) then ($p | split("/" + $sub + "/")[1] | split("/")[0])
+            elif ($p|test("/worktrees/env_")) then ($p | split("/worktrees/")[-1] | split("/")[0])
+            else "" end) as $d |
+        [.id, .environmentId, $d][] | select(. != null and . != "") | "\($s) \(.)"
+    ' 2>/dev/null)" || { BB_FAIL="bb returned unexpected output"; return 1; }
+    while read -r state key; do
+        [ -n "$key" ] || continue
+        if [ "$state" = live ]; then BB_LIVE="$BB_LIVE$key "; else BB_GONE="$BB_GONE$key "; fi
+    done <<<"$keys"
+    # The data dir this bb serves. "No such thread" is only proof of deletion
+    # for worktrees under it -- a dev build's threads are unknown to the release
+    # CLI, not deleted.
+    BB_CLI_DATA_DIR="$("$BB_BIN" status --json 2>/dev/null | jq -r '.dataDir // empty' 2>/dev/null)" \
+        || BB_CLI_DATA_DIR=""
+    [ -n "$BB_CLI_DATA_DIR" ] || BB_CLI_DATA_DIR="${BB_DATA_DIR:-$HOME/.bb}"
+    BB_CLI_DATA_DIR="${BB_CLI_DATA_DIR%/}"
+    return 0
+}
+
+# Is PATH under the data dir the bb CLI serves?
+bb_served_by_cli() {
+    local p d
+    while IFS= read -r p; do
+        while IFS= read -r d; do
+            case "$p" in "$d"/*) return 0 ;; esac
+        done < <(path_forms "$BB_CLI_DATA_DIR")
+    done < <(path_forms "$1")
+    return 1
+}
+
+# Decide one bb worktree: succeed (bb-live) unless bb confirms its thread is
+# archived or deleted. Anything unrecognized or unanswerable is live.
+bb_is_live() {
+    local env="$1" path="$2" id out
+    # Some open thread runs in this env dir (threads can share an environment,
+    # so this outranks whatever thread the dir happens to be named after).
+    case "$BB_LIVE" in *" $env "*) return 0 ;; esac
+    case "$env" in
+        thr_*)
+            id="${env%-[0-9]*}"
+            case "$id" in thr_*[!a-z0-9_]*|thr_) return 0 ;; esac
+            case "$BB_LIVE" in *" $id "*) return 0 ;; esac
+            case "$BB_GONE" in *" $id "*) return 1 ;; esac
+            # Not in either list: ask for it by name.
+            if out="$("$BB_BIN" thread show "$id" --json 2>/dev/null)"; then
+                [ "$(printf '%s' "$out" | jq -r '
+                    if (.thread|type) == "object" and (.thread.archivedAt != null
+                       or .thread.deletedAt != null) then "gone" else "live" end' 2>/dev/null)" = gone ] \
+                    && return 1
+                return 0
+            fi
+            [ "$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)" = thread_not_found ] \
+                && bb_served_by_cli "$path" && return 1
+            return 0
+            ;;
+        env_*)
+            # Older bb names the dir after the environment.
+            case "$BB_LIVE" in *" $env "*) return 0 ;; esac
+            case "$BB_GONE" in *" $env "*) return 1 ;; esac
+            # No thread at all references it: its threads were deleted.
+            bb_served_by_cli "$path" && return 1
+            return 0
+            ;;
+    esac
+    return 0
+}
+
+# Fold the bb-live verdict into RECORDS. bb is only consulted when some
+# worktree is bb-managed, and at most once per run.
+annotate_bb() {
+    [ "${#RECORDS[@]}" -gt 0 ] || return 0
+    local rec touched kb branch status path main env i n=0 envs=() out=()
+    for rec in "${RECORDS[@]}"; do
+        IFS=$'\t' read -r touched kb branch status path main <<<"$rec"
+        env="$(bb_env_dir_of "$path")" || env=""
+        envs+=("$env")
+        [ -n "$env" ] && n=$(( n + 1 ))
+    done
+    [ "$n" -gt 0 ] || return 0
+    local ok=1
+    if ! bb_load_threads; then
+        ok=0
+        printf '%s: warning: could not ask bb which threads are live (%s); treating all %d bb-managed worktree(s) as bb-live.\n' \
+            "$EXTENSION_NAME" "$BB_FAIL" "$n" >&2
+    fi
+    for i in "${!RECORDS[@]}"; do
+        rec="${RECORDS[$i]}"; env="${envs[$i]}"
+        IFS=$'\t' read -r touched kb branch status path main <<<"$rec"
+        if [ -n "$env" ] && { [ "$ok" = 0 ] || bb_is_live "$env" "$path"; }; then
+            case "$status" in
+                clean) status="bb-live" ;;
+                *)     status="bb-live $status" ;;
+            esac
+        fi
+        out+=("$touched"$'\t'"$kb"$'\t'"$branch"$'\t'"$status"$'\t'"$path"$'\t'"$main")
+    done
+    RECORDS=("${out[@]}")
+}
+
+# ---------------------------------------------------------------------------
 # Scan roots
 # ---------------------------------------------------------------------------
 # Directories that trigger macOS TCC permission dialogs or are pure noise.
@@ -469,15 +661,16 @@ resolve_roots() {
             "$HOME/go/src"
         )
         # bb (getbb.app) parks every managed worktree environment under its data
-        # directory as <data-dir>/worktrees/<env-id>/<repo>, one env dir per
-        # environment -- outside any code root, so nothing above would find them.
-        # The data dir is $HOME/.bb by default, $HOME/.bb-dev for a dev build,
-        # and $BB_DATA_DIR when set; list all three and let the existence check
-        # and dedupe below sort it out.
-        maybe+=( "$HOME/.bb/worktrees" "$HOME/.bb-dev/worktrees" )
-        if [ -n "${BB_DATA_DIR:-}" ]; then
-            maybe+=( "$BB_DATA_DIR/worktrees" )
-        fi
+        # directory, one env dir per environment -- outside any code root, so
+        # nothing above would find them. Current bb uses
+        # <data-dir>/plugins/environment-git-worktree/host-data/worktrees/<env>/<repo>,
+        # older bb <data-dir>/worktrees/<env>/<repo>. The data dir is $HOME/.bb
+        # by default, $HOME/.bb-dev for a dev build, and $BB_DATA_DIR when set;
+        # list them all and let the existence check and dedupe sort it out.
+        local dd
+        while IFS= read -r dd; do
+            maybe+=( "$dd/$BB_WT_SUBDIR" "$dd/worktrees" )
+        done < <(bb_data_dirs)
         for r in "${maybe[@]}"; do [ -d "$r" ] && candidates+=("$r"); done
     fi
 
@@ -662,6 +855,10 @@ inspect_marker() {
 # `busy` instead, which does gate on --force.
 is_risky() { case "$1" in *busy*|*dirty*|*unpushed*|*orphan*) return 0 ;; *) return 1 ;; esac; }
 
+# `bb-live` is not risky, it is off limits: its bb thread is still open and will
+# run its next turn in this tree. No flag reaps it -- archive the thread instead.
+is_protected() { case "$1" in *bb-live*) return 0 ;; *) return 1 ;; esac; }
+
 # Removing a worktree can leave its parent directory behind, empty. Harnesses
 # that give every session its own container dir -- bb's
 # <data-dir>/worktrees/<env-id>/<repo>, Conductor's <repo>/.conductor/<name> --
@@ -677,6 +874,8 @@ prune_empty_parent() {
 
 reap_one() {
     local wt="$1" main="$2" status="$3"
+    # Belt and braces: the reap loop already skips these.
+    if is_protected "$status"; then printf 'bb-live: refusing to reap'; return 1; fi
     if [ "$status" = "orphan" ] || [ -z "$main" ]; then
         rm -rf "$wt" || return 1
         prune_empty_parent "$wt"
@@ -768,6 +967,10 @@ main() {
     # every worktree at once.
     annotate_busy
 
+    # Ask bb (once) whether the thread owning each bb-managed worktree is still
+    # open; those read bb-live and are never reaped.
+    annotate_bb
+
     # ---- filter + sort (oldest first) ----
     local filtered=()
     local rec touched kb branch status path main age
@@ -802,6 +1005,7 @@ main() {
               path: .[4], branch: .[2], status: .[3],
               merged: (.[3]|test("merged")),
               busy: (.[3]|test("busy")),
+              bbLive: (.[3]|test("bb-live")),
               locked: (.[3]|test("locked")),
               sizeKb: (.[1]|tonumber),
               touched: (.[0]|tonumber),
@@ -819,9 +1023,9 @@ main() {
         age=$(( NOW - touched ))
         total_kb=$(( total_kb + kb ))
         local color="$C_DIM"
-        # Busy first: a busy tree can also be merged, and must not read green.
+        # bb-live/busy first: such a tree can also be merged, and must not read green.
         case "$status" in
-            *busy*)              color="$C_CYAN" ;;
+            *bb-live*|*busy*)    color="$C_CYAN" ;;
             *orphan*)            color="$C_RED" ;;
             *dirty*|*unpushed*)  color="$C_YELLOW" ;;
             *merged*|clean)      color="$C_GREEN" ;;
@@ -850,6 +1054,13 @@ main() {
     local touched_mains=()
     for rec in "${sorted[@]}"; do
         IFS=$'\t' read -r touched kb branch status path main <<<"$rec"
+
+        # Not even --force: the tree belongs to an open bb thread.
+        if is_protected "$status"; then
+            printf '%s skip%s %s %s(%s -- its bb thread is still open; archive it in bb first)%s\n' \
+                "$C_CYAN" "$C_RESET" "$(tilde "$path")" "$C_DIM" "$status" "$C_RESET"
+            continue
+        fi
 
         if is_risky "$status" && [ "$opt_force" != 1 ]; then
             printf '%s skip%s %s %s(%s -- needs --force)%s\n' \

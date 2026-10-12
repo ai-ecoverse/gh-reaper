@@ -24,11 +24,12 @@ Worktrees are wonderful — until you have forty of them. Tools like [Conductor]
 
 ## Features
 
-- **Machine-wide discovery** — sweeps your usual code roots (`~/Developer`, `~/conductor`, `~/intent/workspaces`, `~/.codex/worktrees`, `~/.bb/worktrees`, `~/Projects`, `~/go/src`, …) for linked worktrees, not just the repo you're standing in. Knows where agent tools (Conductor, yolo, intent, Codex, bb) stash their checkouts — including the ones that hide inside a dotfile directory, like bb's `~/.bb/worktrees/<env-id>/<repo>` (`$BB_DATA_DIR` is honored when set). The worktrees agents nest *inside* a repo are found automatically, since those repos already sit under scanned roots: Claude Code's `<repo>/.claude/worktrees/`, Gemini CLI's `<repo>/.gemini/worktrees/`, and Qwen Code's `<repo>/.qwen/worktrees/`.
+- **Machine-wide discovery** — sweeps your usual code roots (`~/Developer`, `~/conductor`, `~/intent/workspaces`, `~/.codex/worktrees`, bb's worktrees, `~/Projects`, `~/go/src`, …) for linked worktrees, not just the repo you're standing in. Knows where agent tools (Conductor, yolo, intent, Codex, bb) stash their checkouts — including the ones that hide inside a dotfile directory, like bb's `~/.bb/plugins/environment-git-worktree/host-data/worktrees/<env-dir>/<repo>` (and `~/.bb/worktrees/<env-id>/<repo>` from older bb; `$BB_DATA_DIR` is honored when set). The worktrees agents nest *inside* a repo are found automatically, since those repos already sit under scanned roots: Claude Code's `<repo>/.claude/worktrees/`, Gemini CLI's `<repo>/.gemini/worktrees/`, and Qwen Code's `<repo>/.qwen/worktrees/`.
 - **Age & size at a glance** — every worktree shows when it was last touched and how much disk it occupies, sorted oldest-first. "Touched" means the newest **non-gitignored** change, so a routine `npm install` or build doesn't make a months-old worktree look brand new.
 - **Knows what's already done** — flags worktrees whose `HEAD` is already merged into the default branch (`merged`), and optionally asks `gh` whether a branch's PR was squash-merged (`pr-merged`, via `--check-prs`). Sweep just the finished ones with `gh reaper --merged --reap`.
 - **Won't sweep active work** — a worktree with a live process inside it (an agent mid-run, a dev server, a test watcher) is flagged `busy` and skipped, however merged its branch looks. Idle terminal tabs don't count, so a shell you left parked in a finished worktree won't pin it forever.
-- **Safety classification** — each worktree is tagged `merged`, `clean`, `dirty`, `unpushed`, `busy`, `locked`, or `orphan`. Risky ones are never reaped without `--force`. Regenerable dependency lock files (`package-lock.json`, `yarn.lock`, `Cargo.lock`, …) are treated like `.gitignore`d files, so a stray `npm install` doesn't flag a finished worktree as `dirty` (opt out with `--no-ignore-locks`). An agent's own session marker (like Qwen Code's `.qwen-session`) is ignored the same way — and always — so a worktree an agent created and abandoned still reads as `merged`/`clean` and sweeps with `gh reaper --merged --reap`.
+- **Never reaps a live bb thread's worktree** — a [bb](https://getbb.app)-managed worktree whose thread is still open reads `bb-live` and is never removed, not even with `--force`. gh reaper asks the `bb` CLI, once per run; if it can't, every bb worktree counts as live. See [bb worktrees](#bb-worktrees).
+- **Safety classification** — each worktree is tagged `merged`, `clean`, `dirty`, `unpushed`, `busy`, `bb-live`, `locked`, or `orphan`. Risky ones are never reaped without `--force`; `bb-live` ones are never reaped at all. Regenerable dependency lock files (`package-lock.json`, `yarn.lock`, `Cargo.lock`, …) are treated like `.gitignore`d files, so a stray `npm install` doesn't flag a finished worktree as `dirty` (opt out with `--no-ignore-locks`). An agent's own session marker (like Qwen Code's `.qwen-session`) is ignored the same way — and always — so a worktree an agent created and abandoned still reads as `merged`/`clean` and sweeps with `gh reaper --merged --reap`.
 - **macOS-friendly** — scans a curated set of dev directories by default, so it's fast and **never trips macOS privacy (TCC) permission prompts** for Desktop, Documents, Downloads, Photos, and friends.
 - **Reaps the right way** — uses `git worktree remove` (run from the main worktree) so git's bookkeeping stays consistent; `--prune` tidies the admin entries afterward. Harnesses that give each session its own container directory (bb's `<env-id>/`, Conductor's `.conductor/`) don't leave a pile of empty husks behind: an emptied container is removed too, while a directory you scan or name yourself is always left alone.
 - **Read-only by default** — bare `gh reaper` only lists; nothing is deleted until you pass `--reap`. Then confirm each one, `[a]ll` at once, or add `--yes` to sweep unattended. `--json` for the scripty.
@@ -45,7 +46,7 @@ Upgrade later with:
 gh extension upgrade reaper
 ```
 
-**Requirements:** `git`, plus the usual POSIX suspects (`find`, `du`, `stat`, `awk`). `jq` is only needed for `--json`. Works on macOS (BSD tools) and Linux (GNU tools).
+**Requirements:** `git`, plus the usual POSIX suspects (`find`, `du`, `stat`, `awk`). `jq` is needed for `--json`, and to check bb threads (without it, every bb-managed worktree is treated as `bb-live`). Works on macOS (BSD tools) and Linux (GNU tools).
 
 ## Usage
 
@@ -92,7 +93,7 @@ gh reaper [OPTIONS] [PATH...]
   -a, --all            Scan all of $HOME (still skips TCC-protected dirs)
   -y, --yes            With --reap, delete without prompting for each worktree
   -f, --force          With --reap, also remove dirty, unpushed, busy, or
-                       orphaned worktrees
+                       orphaned worktrees (never bb-live ones)
       --prune          With --reap, run 'git worktree prune' on touched repos afterward
       --json           Emit results as JSON (always read-only)
       --dry-run        List only, change nothing (this is the default; kept for habit)
@@ -111,6 +112,7 @@ gh reaper [OPTIONS] [PATH...]
 | `dirty`     | Uncommitted or untracked changes present                       | 🔒 needs `--force`  |
 | `unpushed`  | Commits that exist nowhere on a remote (would be lost)         | 🔒 needs `--force`  |
 | `busy`      | A live process is working in this tree right now               | 🔒 needs `--force`  |
+| `bb-live`   | A bb worktree whose bb thread is still open                    | 🚫 never, not even with `--force` |
 | `locked`    | `git worktree lock` is set; a stale lock is lifted on reap     | ✅ yes (if stale)    |
 | `orphan`    | The main repository is gone; only the lonely checkout remains  | 🔒 needs `--force`  |
 
@@ -134,6 +136,46 @@ so a crashed session leaves a lock that pins the worktree forever. Reaping reads
 that reason: if the owning process is gone the lock is lifted with
 `git worktree unlock` and the reap proceeds; if it's still alive the worktree
 reads `busy locked` and is spared.
+
+### bb worktrees
+
+[bb](https://getbb.app) gives every agent thread its own worktree, under
+`<data-dir>/plugins/environment-git-worktree/host-data/worktrees/thr_<id>-<n>/<repo>`
+(older bb used `<data-dir>/worktrees/env_<id>/<repo>`). The data dir is `~/.bb`,
+`~/.bb-dev` for a dev build, or `$BB_DATA_DIR`. Both layouts are scanned by default.
+
+**Why `bb-live` is never reaped.** bb keeps a thread's worktree for as long as
+the *thread* is open, not as long as its branch is unmerged. Once a thread's PR
+merges, its worktree reads `merged clean`, which is exactly what
+`--merged --reap --yes` sweeps. But the thread is still running, and its next
+turn runs in that tree. This happened for real: a `gh reaper --merged --reap`
+during a disk-full emergency removed the checkouts of nine live threads. bb was
+left holding only its env dir and `<repo>.completed` marker, couldn't restore
+them, and those threads' next turns failed. Git can't tell an open thread from
+a finished one. Only bb can.
+
+So for every bb-managed worktree, gh reaper asks bb:
+
+- One `bb thread list --json` (plus `--archived`, hidden threads included) up
+  front answers for every worktree at once. Threads that aren't in either list
+  are looked up with `bb thread show`.
+- If **any open thread** runs in the worktree's env dir, it reads `bb-live`.
+  Threads can share an environment, so this outranks whichever thread the dir is
+  named after. An older `env_<id>` dir is matched by environment id.
+- `bb-live` is **never reaped**, not with `--yes` and not with `--force`. Archive
+  the thread in bb to release its worktree.
+- Only a worktree whose thread bb reports **archived or deleted** goes on to the
+  usual rules. bb's own bookkeeping (the env dir and its `.completed` marker) is
+  left alone.
+- **Fail safe:** if `bb` isn't installed, errors, or returns something
+  unexpected (or `jq` is missing), *every* bb-managed worktree reads `bb-live`
+  and a single warning goes to stderr. "Thread not found" counts as deleted only
+  for worktrees under the data dir that this `bb` serves (`bb status`). A dev
+  build's threads are unknown to the release CLI, which doesn't make them
+  deleted.
+
+bb is only consulted when a scan turns up bb-managed worktrees. `--json` reports
+the verdict as a `bbLive` boolean.
 
 **Lock files don't count as dirty.** Regenerable dependency lock files
 (`package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`,
@@ -174,6 +216,7 @@ special handling.
 - **Read-only by default.** Nothing is ever removed unless you pass `--reap`; `--dry-run` and `--json` are always read-only, and `--yes`/`--force` do nothing on their own.
 - `dirty`, `unpushed`, `busy`, and `orphan` worktrees are **skipped unless `--force`** — your uncommitted edits, unpushed commits, and in-flight sessions are safe by default.
 - **Work in progress outranks a merged branch.** A live process inside a worktree marks it `busy`, so even `--merged --reap --yes` leaves it alone.
+- **An open bb thread's worktree is untouchable.** `bb-live` is never reaped, not even with `--force`. If bb can't be asked, every bb worktree is treated as live.
 - With `--reap`, interactive mode asks per worktree (`[y]es / [n]o / [a]ll / [q]uit`); add `--yes` to skip the prompts.
 - It only ever targets linked worktrees — it will never offer to delete a main repository.
 
