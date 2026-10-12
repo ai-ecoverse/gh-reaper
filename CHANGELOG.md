@@ -3,6 +3,31 @@
 All notable changes to `gh-reaper` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.9.0] - 2026-10-12
+
+### Added
+- **`bb-live`: the worktree of an open bb thread is never reaped.** bb keeps a
+  thread's worktree for the life of the *thread*, not the branch. Once a
+  thread's PR merges, its tree reads `merged clean`, but bb still runs the
+  thread's next turn there. Found in the field: a disk-full
+  `gh reaper --merged --reap` removed the checkouts of nine live bb threads.
+  bb was left with only its env dir and `<repo>.completed` marker, couldn't
+  restore them, and those threads' next turns failed. gh reaper now asks the
+  `bb` CLI about every bb-managed worktree, using one `bb thread list --json`
+  (plus `--archived`) per run and `bb thread show` for any thread missing from
+  both. A worktree that any open thread runs in reads `bb-live` and is skipped
+  by every reap, `--force` included. Only a worktree whose thread is archived or
+  deleted goes on to the usual rules. It fails safe: if `bb` (or `jq`) is
+  missing or fails, every bb-managed worktree is `bb-live`, and one warning
+  goes to stderr. `--json` gains a `bbLive` boolean.
+
+### Fixed
+- **Scans bb's current worktree location.** Current bb keeps worktrees under
+  `<data-dir>/plugins/environment-git-worktree/host-data/worktrees/<env-dir>/<repo>`,
+  not `<data-dir>/worktrees/`. The old path is still scanned for older bb.
+  Before this fix, those worktrees were only found when another scan root
+  happened to cover them.
+
 ## [1.8.0] - 2026-08-19
 
 ### Added
