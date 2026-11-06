@@ -3,6 +3,23 @@
 All notable changes to `gh-reaper` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.10.0] - 2026-11-06
+
+### Added
+- **Finds Delta's agent worktrees.** [Delta](https://zed.dev) (Zed's agent)
+  parks each session at `<repo>/.delta/worktrees/<id>/<repo>` with the gitdir
+  at `<repo>/.delta/clones/<id>/<repo>.git` — git's separate-git-dir layout,
+  not a linked worktree of the parent repo. `git worktree list` in the parent
+  never lists them, and gh-reaper used to skip them too because their gitdir
+  path has no `/worktrees/` component (the filter that excludes submodules).
+  Found in the field under `~/Developer` (slicc, skills, bb-auggie): forgotten
+  Delta checkouts filling the disk while `gh reaper` reported none of them.
+  Those checkouts are now discovered under the roots already scanned, classified
+  with the usual safety rules (`dirty` / `unpushed` / `busy` still need
+  `--force`; `bb-live` is still never reaped), and reaped by removing the
+  checkout plus its paired clone (since `git worktree remove` cannot delete a
+  main working tree).
+
 ## [1.9.0] - 2026-10-12
 
 ### Added

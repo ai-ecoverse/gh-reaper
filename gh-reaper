@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # gh-reaper - GitHub CLI extension that harvests stale git worktrees
-# Version: 1.9.0
+# Version: 1.10.0
 # https://github.com/ai-ecoverse/gh-reaper
 #
 # Seasons don't fear the reaper. Nor do your forgotten worktrees -- until now.
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-VERSION="1.9.0"
+VERSION="1.10.0"
 EXTENSION_NAME="gh-reaper"
 
 # Space-delimited, space-padded list of the roots this run scans. Consulted when
@@ -714,8 +714,17 @@ inspect_marker() {
 
     IFS= read -r line < "$gitfile" 2>/dev/null || return 0
     case "$line" in gitdir:*) gitdir="${line#gitdir: }" ;; *) return 0 ;; esac
-    # Only worktrees -- not submodules ('.../modules/...').
-    case "$gitdir" in */worktrees/*) ;; *) return 0 ;; esac
+    # Only worktrees -- not submodules ('.../modules/...'). Linked worktrees
+    # point at <main>/.git/worktrees/<name>. Delta (Zed) is different: it uses
+    # git's separate-git-dir layout, with the checkout at
+    # <repo>/.delta/worktrees/<id>/<repo> and the gitdir at
+    # <repo>/.delta/clones/<id>/<repo>.git -- no /worktrees/ in the gitdir --
+    # so accept those by the checkout path instead. They are invisible to
+    # `git worktree list` in the parent repo, which is why they went unseen.
+    case "$gitdir" in */worktrees/*) ;; *)
+        case "$wt" in */.delta/worktrees/*) ;; *) return 0 ;; esac
+        ;;
+    esac
     # Resolve a relative gitdir against the worktree.
     case "$gitdir" in /*) ;; *) gitdir="$wt/$gitdir" ;; esac
 
@@ -861,10 +870,11 @@ is_protected() { case "$1" in *bb-live*) return 0 ;; *) return 1 ;; esac; }
 
 # Removing a worktree can leave its parent directory behind, empty. Harnesses
 # that give every session its own container dir -- bb's
-# <data-dir>/worktrees/<env-id>/<repo>, Conductor's <repo>/.conductor/<name> --
-# would otherwise accumulate one empty husk per tree reaped. Drop the parent
-# only when it is empty *and* is not itself a scan root, so a directory you
-# created on purpose (~/worktrees, ~/Developer) never vanishes under you.
+# <data-dir>/worktrees/<env-id>/<repo>, Conductor's <repo>/.conductor/<name>,
+# Delta's <repo>/.delta/worktrees/<id>/<repo> -- would otherwise accumulate one
+# empty husk per tree reaped. Drop the parent only when it is empty *and* is
+# not itself a scan root, so a directory you created on purpose (~/worktrees,
+# ~/Developer) never vanishes under you.
 prune_empty_parent() {
     local parent; parent="$(dirname "$1")"
     case "$parent" in /|"$HOME") return 0 ;; esac
@@ -872,10 +882,36 @@ prune_empty_parent() {
     rmdir "$parent" 2>/dev/null || true
 }
 
+# Delta (Zed) agent checkouts: <repo>/.delta/worktrees/<id>/<name>.
+is_delta_worktree() {
+    case "$1" in */.delta/worktrees/*/*) return 0 ;; *) return 1 ;; esac
+}
+
 reap_one() {
     local wt="$1" main="$2" status="$3"
     # Belt and braces: the reap loop already skips these.
     if is_protected "$status"; then printf 'bb-live: refusing to reap'; return 1; fi
+    # Delta checkouts are the main working tree of a separate-git-dir repo
+    # (gitdir under .delta/clones/). `git worktree remove` cannot remove a main
+    # working tree, and the parent repo never registered them, so delete the
+    # checkout and its paired clone directly. Same safety gates as everything
+    # else: dirty/unpushed/busy still need --force; bb-live is refused above.
+    if is_delta_worktree "$wt"; then
+        local dgit="" dline
+        if [ -f "$wt/.git" ]; then
+            IFS= read -r dline < "$wt/.git" 2>/dev/null || dline=""
+            case "$dline" in gitdir:*) dgit="${dline#gitdir: }" ;; esac
+            case "$dgit" in /*) ;; *) [ -n "$dgit" ] && dgit="$wt/$dgit" ;; esac
+        fi
+        rm -rf "$wt" || return 1
+        prune_empty_parent "$wt"
+        case "$dgit" in */.delta/clones/*)
+            rm -rf "$dgit" 2>/dev/null || true
+            prune_empty_parent "$dgit"
+            ;;
+        esac
+        return 0
+    fi
     if [ "$status" = "orphan" ] || [ -z "$main" ]; then
         rm -rf "$wt" || return 1
         prune_empty_parent "$wt"
