@@ -821,6 +821,155 @@ JSON
 fi
 
 # ---------------------------------------------------------------------------
+# Delta (Zed) agent worktrees: <repo>/.delta/worktrees/<id>/<repo> with the
+# gitdir at <repo>/.delta/clones/<id>/<repo>.git (separate-git-dir). Invisible
+# to the parent repo's `git worktree list`, and previously skipped because the
+# gitdir path has no /worktrees/ component. Same safety rules as everything
+# else: dirty / unpushed / busy need --force; a clean/merged one reaps (and
+# takes its paired clone with it).
+# ---------------------------------------------------------------------------
+if command -v git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    DSBX="$(mktemp -d)/delta"; mkdir -p "$DSBX"
+    DELTA_PIDS=()
+
+    # Build one Delta-style separate-git-dir checkout under $DSBX.
+    # $1=id  $2=branch  $3=kind (clean|dirty|unpushed|merged)
+    make_delta() {
+        local id="$1" branch="$2" kind="$3"
+        local clone="$DSBX/.delta/clones/$id/repo.git"
+        local wt="$DSBX/.delta/worktrees/$id/repo"
+        mkdir -p "$(dirname "$clone")" "$(dirname "$wt")"
+        g init --separate-git-dir="$clone" "$wt" >/dev/null
+        g -C "$wt" remote add origin "$DSBX/remote.git"
+        g -C "$wt" fetch -q origin
+        g -C "$wt" checkout -q -B "$branch" origin/main
+        g -C "$wt" config core.worktree "$wt"
+        case "$kind" in
+            clean)
+                echo "$id" > "$wt/f.txt"
+                g -C "$wt" add f.txt && g -C "$wt" commit -qm "$id"
+                g -C "$wt" push -q -u origin "$branch"
+                ;;
+            dirty)
+                echo "$id" > "$wt/f.txt"
+                g -C "$wt" add f.txt && g -C "$wt" commit -qm "$id"
+                g -C "$wt" push -q -u origin "$branch"
+                echo wip > "$wt/wip.txt"
+                ;;
+            unpushed)
+                echo "$id" > "$wt/f.txt"
+                g -C "$wt" add f.txt && g -C "$wt" commit -qm "$id"
+                # deliberately never pushed
+                ;;
+            merged)
+                echo "$id" > "$wt/f.txt"
+                g -C "$wt" add f.txt && g -C "$wt" commit -qm "$id"
+                g -C "$wt" push -q -u origin "$branch"
+                # Merge into main via the seed checkout (fetch the branch first).
+                g -C "$DSBX/seed" fetch -q origin "$branch"
+                g -C "$DSBX/seed" merge -q --no-ff "FETCH_HEAD" -m "merge $branch"
+                g -C "$DSBX/seed" push -q origin main
+                # Refresh this checkout's origin/main so the merged signal lands.
+                g -C "$wt" fetch -q origin
+                ;;
+        esac
+    }
+
+    (
+        cd "$DSBX" || exit 1
+        g init --bare remote.git >/dev/null
+        g init seed >/dev/null
+        cd seed || exit 1
+        g remote add origin "$DSBX/remote.git"
+        echo hi > a.txt; g add a.txt; g commit -qm init
+        g push -q -u origin main
+        g remote set-head origin main
+        cd "$DSBX" || exit 1
+
+        make_delta clean feat-d-clean clean
+        make_delta dirty feat-d-dirty dirty
+        make_delta unpushed feat-d-unpushed unpushed
+        make_delta merged feat-d-merged merged
+        make_delta busy feat-d-busy merged
+    ) >/dev/null 2>&1
+
+    # Live non-shell process parked in the busy Delta checkout.
+    ( cd "$DSBX/.delta/worktrees/busy/repo" && exec sleep 120 ) &
+    DELTA_PIDS+=("$!")
+    sleep 1
+
+    dstatusof() { "$REAPER" --json --path "$DSBX" 2>/dev/null \
+        | jq -r --arg b "$1" '.[]|select(.branch==$b)|.status' 2>/dev/null; }
+
+    check  # discovery: all five Delta checkouts surface (previously: zero)
+    n="$("$REAPER" --json --path "$DSBX" 2>/dev/null | jq 'length' 2>/dev/null)"
+    [ "$n" = 5 ] && ok "discovers Delta .delta/worktrees checkouts" \
+        || no "discovers Delta .delta/worktrees checkouts" "got: $n"
+
+    check
+    s="$(dstatusof feat-d-clean)"
+    [ "$s" = "clean" ] && ok "Delta clean checkout reads clean" \
+        || no "Delta clean checkout reads clean" "got: $s"
+
+    check
+    s="$(dstatusof feat-d-dirty)"
+    [ "$s" = "dirty" ] && ok "Delta dirty checkout reads dirty" \
+        || no "Delta dirty checkout reads dirty" "got: $s"
+
+    check
+    s="$(dstatusof feat-d-unpushed)"
+    [ "$s" = "unpushed" ] && ok "Delta unpushed checkout reads unpushed" \
+        || no "Delta unpushed checkout reads unpushed" "got: $s"
+
+    check
+    s="$(dstatusof feat-d-merged)"
+    [ "$s" = "merged" ] && ok "Delta merged checkout reads merged" \
+        || no "Delta merged checkout reads merged" "got: $s"
+
+    check
+    s="$(dstatusof feat-d-busy)"
+    [ "$s" = "busy merged" ] && ok "Delta in-use checkout reads busy" \
+        || no "Delta in-use checkout reads busy" "got: $s"
+
+    check  # --reap --yes: reap clean+merged, report/skip dirty+unpushed+busy
+    "$REAPER" --reap --yes --no-color --path "$DSBX" >/dev/null 2>&1
+    if [ ! -d "$DSBX/.delta/worktrees/clean/repo" ] \
+       && [ ! -d "$DSBX/.delta/worktrees/merged/repo" ] \
+       && [ -d "$DSBX/.delta/worktrees/dirty/repo" ] \
+       && [ -d "$DSBX/.delta/worktrees/unpushed/repo" ] \
+       && [ -d "$DSBX/.delta/worktrees/busy/repo" ]; then
+        ok "Delta: reaps clean+merged, skips dirty+unpushed+busy"
+    else
+        no "Delta: reaps clean+merged, skips dirty+unpushed+busy" \
+           "clean=$([ -d "$DSBX/.delta/worktrees/clean/repo" ]&&echo y||echo n) merged=$([ -d "$DSBX/.delta/worktrees/merged/repo" ]&&echo y||echo n) dirty=$([ -d "$DSBX/.delta/worktrees/dirty/repo" ]&&echo y||echo n) unpushed=$([ -d "$DSBX/.delta/worktrees/unpushed/repo" ]&&echo y||echo n) busy=$([ -d "$DSBX/.delta/worktrees/busy/repo" ]&&echo y||echo n)"
+    fi
+
+    check  # reaping a Delta checkout also drops its paired clone + empty id dir
+    if [ ! -d "$DSBX/.delta/clones/clean" ] && [ ! -d "$DSBX/.delta/clones/merged" ] \
+       && [ -d "$DSBX/.delta/clones/dirty" ] && [ -d "$DSBX/.delta/worktrees" ]; then
+        ok "Delta: reaping removes paired clone, keeps .delta/worktrees root"
+    else
+        no "Delta: reaping removes paired clone, keeps .delta/worktrees root" \
+           "clone-clean=$([ -d "$DSBX/.delta/clones/clean" ]&&echo y||echo n) clone-merged=$([ -d "$DSBX/.delta/clones/merged" ]&&echo y||echo n) clone-dirty=$([ -d "$DSBX/.delta/clones/dirty" ]&&echo y||echo n) wt-root=$([ -d "$DSBX/.delta/worktrees" ]&&echo y||echo n)"
+    fi
+
+    check  # --force clears the risky remainder, including the busy one
+    "$REAPER" --reap --yes --force --no-color --path "$DSBX" >/dev/null 2>&1
+    if [ ! -d "$DSBX/.delta/worktrees/dirty/repo" ] \
+       && [ ! -d "$DSBX/.delta/worktrees/unpushed/repo" ] \
+       && [ ! -d "$DSBX/.delta/worktrees/busy/repo" ]; then
+        ok "Delta: --force reaps dirty+unpushed+busy"
+    else
+        no "Delta: --force reaps dirty+unpushed+busy" \
+           "dirty=$([ -d "$DSBX/.delta/worktrees/dirty/repo" ]&&echo y||echo n) unpushed=$([ -d "$DSBX/.delta/worktrees/unpushed/repo" ]&&echo y||echo n) busy=$([ -d "$DSBX/.delta/worktrees/busy/repo" ]&&echo y||echo n)"
+    fi
+
+    for p in "${DELTA_PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    wait 2>/dev/null
+    rm -rf "$(dirname "$DSBX")"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 printf "Tests run: %d   ${GREEN}passed: %d${NC}   ${RED}failed: %d${NC}\n" "$RUN" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
